@@ -308,7 +308,7 @@ def draw_onion_skins():
             if props.use_fade:
                 # Index-based fade: closest (i=0) → full opacity
                 #                   farthest (i=n-1) → 0
-                t = i / max(n - 1, 1)
+                t = (i + 1) / (n + 1)
                 factor = (1.0 - t) ** props.fade_falloff
                 alpha = props.opacity * factor
             else:

@@ -288,6 +288,7 @@ def draw_onion_skins():
     before_sorted = sorted([f for f in cache if f < current], reverse=True)  # 가까운 것 먼저
     after_sorted  = sorted([f for f in cache if f > current])                 # 가까운 것 먼저
 
+
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_mask_set(False)
     if props.ghost_in_front:
@@ -308,7 +309,7 @@ def draw_onion_skins():
             if props.use_fade:
                 # 인덱스 기반 페이드: 가장 가까운 것(i=0) → opacity 그대로
                 #                      가장 먼 것(i=n-1) → 0
-                t = i / max(n - 1, 1)
+                t = (i + 1) / (n + 1)
                 factor = (1.0 - t) ** props.fade_falloff
                 alpha = props.opacity * factor
             else:

@@ -1,6 +1,6 @@
 bl_info = {
     "name": "Mesh Onion Skin",
-    "author": "Claude",
+    "author": "HB PARK",
     "version": (1, 2, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Onion Skin",

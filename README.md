@@ -4,9 +4,13 @@ Onion skin addon for Blender 5.0+ — see previous and next poses as ghost overl
 
 > **[한국어 README](README_KR.md)**
 
-|All Frames|Keyframe Only|Wireframe|
+|All Frames|Keyframe Only|
+|:-:|:-:|
+|![All Frames](images/01_all_frame.png)|![Keyframe Only](images/02_keyframe_only.png)|
+
+|Ghost In Front|Mesh In Front|Wireframe|
 |:-:|:-:|:-:|
-|![All Frames](images/01_all_frame.png)|![Keyframe Only](images/02_keyframe_only.png)|![Wireframe](images/05_wireframe.png)|
+|![Ghost In Front](images/03_ghost_front.png)|![Mesh In Front](images/04_mesh_front.png)|![Wireframe](images/05_wireframe.png)|
 
 |Active Mode|Scene Mode|Collection Mode|
 |:-:|:-:|:-:|

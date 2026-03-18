@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Mesh Onion Skin",
     "author": "HB PARK",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Onion Skin",
     "description": "GPU-based onion skin ghosts for 3D mesh animations",
@@ -12,7 +12,10 @@ import bpy
 import gpu
 import numpy as np
 from bpy.app.handlers import persistent
-from bpy.props import BoolProperty, IntProperty, FloatProperty, FloatVectorProperty
+from bpy.props import (
+    BoolProperty, IntProperty, FloatProperty,
+    FloatVectorProperty, EnumProperty, PointerProperty,
+)
 from bpy.types import PropertyGroup, Operator, Panel
 from gpu_extras.batch import batch_for_shader
 
@@ -26,14 +29,20 @@ _onion_cache: dict[str, dict[int, gpu.types.GPUBatch]] = {}
 _draw_handle = None
 _is_baking = False
 _rebuild_scheduled = False
-_pending_rebuild = None  # (scene, obj_name)
+_pending_rebuild = None  # (scene,)
 # mesh_in_front 적용 전 원래 show_in_front 값 보존 {오브젝트명: bool}
 _original_mesh_show_in_front: dict[str, bool] = {}
+
+_PERF_WARN_THRESHOLD = 10
 
 
 def _get_shader():
     return gpu.shader.from_builtin('UNIFORM_COLOR')
 
+
+# ---------------------------------------------------------------------------
+# 타겟 수집
+# ---------------------------------------------------------------------------
 
 def _get_target_mesh(context=None):
     """활성 오브젝트 또는 포즈모드 아마추어의 메시 자식 반환."""
@@ -48,6 +57,60 @@ def _get_target_mesh(context=None):
             if child.type == 'MESH':
                 return child
     return None
+
+
+def _has_animation(obj) -> bool:
+    """오브젝트에 애니메이션 데이터가 있는지 확인."""
+    if obj.animation_data and obj.animation_data.action:
+        return True
+    arm = _find_armature(obj)
+    if arm and _get_active_action(arm):
+        return True
+    if obj.data and hasattr(obj.data, 'shape_keys') and obj.data.shape_keys:
+        if obj.data.shape_keys.animation_data:
+            return True
+    return False
+
+
+def _collect_target_meshes(scene=None, context=None) -> list:
+    """모드에 따라 대상 메시 오브젝트 리스트 반환."""
+    if scene is None:
+        try:
+            scene = context.scene if context else bpy.context.scene
+        except AttributeError:
+            return []
+    try:
+        props = scene.mesh_onion_skin
+    except AttributeError:
+        return []
+
+    if props.mode == 'ACTIVE':
+        ctx = context if context is not None else bpy.context
+        obj = _get_target_mesh(ctx)
+        return [obj] if obj else []
+
+    # SCENE / COLLECTION 모드
+    if props.mode == 'COLLECTION':
+        col = props.target_collection
+        if col is None:
+            return []
+        source = col.all_objects
+    else:  # SCENE
+        source = scene.collection.all_objects
+
+    candidates = [o for o in source if o.type == 'MESH']
+
+    # 필터: 보이는 것 + 애니메이션 있는 것만
+    candidates = [o for o in candidates if o.visible_get()]
+    candidates = [o for o in candidates if _has_animation(o)]
+
+    # 최대 개수 제한
+    max_obj = props.max_objects
+    if len(candidates) > max_obj:
+        candidates = candidates[:max_obj]
+
+    return candidates
+
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +197,11 @@ def _get_target_frames(scene, props, obj) -> list[int]:
     current = scene.frame_current
     frames: list[int] = []
 
-    if props.use_keyframes:
+    # 키프레임 모드는 Active 모드에서만 동작
+    if props.use_keyframes and props.mode == 'ACTIVE':
         _status, keyframes = _get_armature_keyframes(obj)
-        # current 기준 이전/이후 키프레임 분리
         before = [f for f in keyframes if f < current]
         after  = [f for f in keyframes if f > current]
-        # count=0이면 before[-0:] = 전체가 되므로 명시적 체크
         if props.count_before > 0:
             frames.extend(before[-props.count_before:])
         if props.count_after > 0:
@@ -147,22 +209,19 @@ def _get_target_frames(scene, props, obj) -> list[int]:
     else:
         step = props.frame_step
         for i in range(1, props.count_before + 1):
-            f = current - i * step
-            if f >= scene.frame_start:
-                frames.append(f)
+            frames.append(current - i * step)
         for i in range(1, props.count_after + 1):
-            f = current + i * step
-            if f <= scene.frame_end:
-                frames.append(f)
+            frames.append(current + i * step)
 
     return frames
 
 
-def _bake_frame(scene, obj, frame: int, use_flat: bool):
-    """해당 프레임으로 이동 후 메시 스냅샷을 GPU 배치로 반환."""
-    scene.frame_set(frame)
-    depsgraph = bpy.context.evaluated_depsgraph_get()
+# ---------------------------------------------------------------------------
+# 베이킹
+# ---------------------------------------------------------------------------
 
+def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
+    """depsgraph가 이미 설정된 상태에서 메시 스냅샷을 GPU 배치로 반환."""
     eval_obj = obj.evaluated_get(depsgraph)
     mesh = eval_obj.to_mesh()
     if mesh is None or len(mesh.vertices) == 0:
@@ -206,8 +265,8 @@ def _bake_frame(scene, obj, frame: int, use_flat: bool):
     return batch
 
 
-def rebuild_cache(scene, obj=None):
-    """활성 오브젝트의 어니언 스킨 캐시를 증분 빌드."""
+def rebuild_cache(scene, targets=None):
+    """대상 오브젝트들의 어니언 스킨 캐시를 증분 빌드."""
     global _is_baking
     if _is_baking:
         return
@@ -216,50 +275,59 @@ def rebuild_cache(scene, obj=None):
     if not props.enabled:
         return
 
-    if obj is None:
-        obj = _get_target_mesh()
-    if obj is None:
-        return
-
-    name = obj.name
-    targets = _get_target_frames(scene, props, obj)
+    if targets is None:
+        targets = _collect_target_meshes()
     if not targets:
-        clear_cache(name)
+        clear_cache()
         return
 
-    existing = _onion_cache.get(name, {})
-    target_set = set(targets)
-    if set(existing.keys()) == target_set:
+    # 유효하지 않은 캐시 정리
+    valid_names = {obj.name for obj in targets}
+    stale = [k for k in _onion_cache if k not in valid_names]
+    for k in stale:
+        _onion_cache.pop(k, None)
+
+    # 오브젝트별 타겟 프레임 수집 + 프레임-우선 베이킹 맵 구성
+    obj_target_frames: dict[str, set[int]] = {}
+    frames_to_objects: dict[int, list] = {}
+    for obj in targets:
+        frame_list = _get_target_frames(scene, props, obj)
+        if not frame_list:
+            clear_cache(obj.name)
+            continue
+        target_set = set(frame_list)
+        obj_target_frames[obj.name] = target_set
+
+        # 기존 캐시와 비교하여 베이킹 필요한 프레임만 수집
+        existing = _onion_cache.get(obj.name, {})
+        new_cache: dict[int, gpu.types.GPUBatch] = {}
+        for f in frame_list:
+            if f in existing:
+                new_cache[f] = existing[f]
+            else:
+                frames_to_objects.setdefault(f, []).append(obj)
+        _onion_cache[obj.name] = new_cache
+
+    if not frames_to_objects:
         return
 
-    new_cache: dict[int, gpu.types.GPUBatch] = {}
-    to_bake: list[int] = []
-    for f in targets:
-        if f in existing:
-            new_cache[f] = existing[f]
-        else:
-            to_bake.append(f)
-
-    if not to_bake:
-        _onion_cache[name] = new_cache
-        return
-
+    # 프레임-우선 루프: frame_set 호출 최소화
     current = scene.frame_current
     _is_baking = True
     try:
-        for f in to_bake:
-            batch = _bake_frame(scene, obj, f, props.use_flat)
-            if batch is not None:
-                new_cache[f] = batch
+        for frame in sorted(frames_to_objects.keys()):
+            scene.frame_set(frame)
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            for obj in frames_to_objects[frame]:
+                batch = _bake_mesh_snapshot(obj, depsgraph, props.use_flat)
+                if batch is not None:
+                    _onion_cache.setdefault(obj.name, {})[frame] = batch
     finally:
         try:
             scene.frame_set(current)
         except Exception:
             pass
         _is_baking = False
-
-    _onion_cache[name] = new_cache
-
 
 
 # ---------------------------------------------------------------------------
@@ -273,25 +341,17 @@ def draw_onion_skins():
     if not props.enabled:
         return
 
-    obj = _get_target_mesh()
-    if obj is None:
-        return
-
-    cache = _onion_cache.get(obj.name)
-    if not cache:
+    # 캐시에 있는 오브젝트만 드로우 (rebuild_cache가 이미 수집/베이킹)
+    targets = [bpy.data.objects.get(n) for n in _onion_cache if bpy.data.objects.get(n)]
+    if not targets:
         return
 
     current = scene.frame_current
     shader = _get_shader()
 
-    # 이전/이후 프레임을 가까운 순서로 정렬 (인덱스 기반 페이드용)
-    before_sorted = sorted([f for f in cache if f < current], reverse=True)  # 가까운 것 먼저
-    after_sorted  = sorted([f for f in cache if f > current])                 # 가까운 것 먼저
-
-
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_mask_set(False)
-    if props.ghost_in_front:
+    if props.in_front == 'GHOST':
         gpu.state.depth_test_set('NONE')
     else:
         gpu.state.depth_test_set('LESS_EQUAL')
@@ -300,15 +360,13 @@ def draw_onion_skins():
 
     shader.bind()
 
-    def _draw_group(frames, color_rgb):
+    def _draw_group(frames, color_rgb, cache):
         n = len(frames)
         for i, frame in enumerate(frames):
             batch = cache.get(frame)
             if batch is None:
                 continue
             if props.use_fade:
-                # 인덱스 기반 페이드: 가장 가까운 것(i=0) → opacity 그대로
-                #                      가장 먼 것(i=n-1) → 0
                 t = (i + 1) / (n + 1)
                 factor = (1.0 - t) ** props.fade_falloff
                 alpha = props.opacity * factor
@@ -317,8 +375,14 @@ def draw_onion_skins():
             shader.uniform_float("color", (*color_rgb[:3], alpha))
             batch.draw(shader)
 
-    _draw_group(before_sorted, props.color_before)
-    _draw_group(after_sorted,  props.color_after)
+    for obj in targets:
+        cache = _onion_cache.get(obj.name)
+        if not cache:
+            continue
+        before_sorted = sorted([f for f in cache if f < current], reverse=True)
+        after_sorted  = sorted([f for f in cache if f > current])
+        _draw_group(before_sorted, props.color_before, cache)
+        _draw_group(after_sorted,  props.color_after, cache)
 
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('NONE')
@@ -335,10 +399,22 @@ def draw_onion_skins():
 def _on_frame_change(scene, depsgraph):
     if _is_baking:
         return
-    props = scene.mesh_onion_skin
+    try:
+        props = scene.mesh_onion_skin
+    except AttributeError:
+        return
     if not props.enabled:
         return
-    rebuild_cache(scene)
+    targets = _collect_target_meshes(scene=scene)
+    rebuild_cache(scene, targets)
+    # 캐시 갱신 후 뷰포트 리드로우 요청
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+    except Exception:
+        pass
 
 
 @persistent
@@ -357,16 +433,14 @@ def _do_rebuild():
     _pending_rebuild = None
     if data is None:
         return None
-    scene, obj_name = data
+    scene, targets = data
     try:
         props = scene.mesh_onion_skin
     except AttributeError:
         return None
     if not props.enabled:
         return None
-    # bpy.context.view_layer 대신 bpy.data.objects 사용 → 타이머 컨텍스트에서 안전
-    obj = bpy.data.objects.get(obj_name) if obj_name else None
-    rebuild_cache(scene, obj)
+    rebuild_cache(scene, targets)
     try:
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
@@ -379,14 +453,14 @@ def _do_rebuild():
 
 def _schedule_rebuild(context=None):
     global _rebuild_scheduled, _pending_rebuild
-    obj = _get_target_mesh(context)
-    obj_name = obj.name if obj else None
-    clear_cache(obj_name)
+    clear_cache()
     try:
         scene = context.scene if context else bpy.context.scene
     except AttributeError:
         return
-    _pending_rebuild = (scene, obj_name)
+    # 유효한 context가 있을 때 타겟을 미리 캡처
+    targets = _collect_target_meshes(scene=scene, context=context)
+    _pending_rebuild = (scene, targets)
     if not _rebuild_scheduled:
         _rebuild_scheduled = True
         bpy.app.timers.register(_do_rebuild, first_interval=0.0)
@@ -432,6 +506,13 @@ def _update_cache(self, context):
     scene = context.scene if context else bpy.context.scene
     _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_keyframes')
     _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_flat')
+    _clear_fcurve_if_present(scene, 'mesh_onion_skin.mode')
+    _schedule_rebuild(context)
+    _tag_redraw(context)
+
+
+def _update_mode(self, context):
+    """모드 전환 시 – 캐시 클리어 + 리빌드."""
     _schedule_rebuild(context)
     _tag_redraw(context)
 
@@ -441,6 +522,7 @@ def _update_enabled(self, context):
     if self.enabled:
         _schedule_rebuild(context)
     else:
+    
         clear_cache()
     _tag_redraw(context)
 
@@ -450,17 +532,15 @@ def _update_display(self, context):
     _tag_redraw(context)
 
 
-def _update_mesh_in_front(self, context):
-    """메쉬 앞에 표시 설정 변경 시 – 실제 오브젝트 속성에 적용."""
-    obj = _get_target_mesh(context)
-    if obj:
-        if self.mesh_in_front:
-            # 아직 저장 안 된 경우에만 원래 값 보존
+def _update_in_front(self, context):
+    """앞에 표시 모드 변경 시 – 메쉬 show_in_front 적용/복원."""
+    targets = _collect_target_meshes(context=context)
+    for obj in targets:
+        if self.in_front == 'MESH':
             if obj.name not in _original_mesh_show_in_front:
                 _original_mesh_show_in_front[obj.name] = obj.show_in_front
             obj.show_in_front = True
         else:
-            # 원래 값 복원 (저장된 게 없으면 False)
             obj.show_in_front = _original_mesh_show_in_front.pop(obj.name, False)
     _tag_redraw(context)
 
@@ -476,6 +556,27 @@ class MeshOnionSkinProps(PropertyGroup):
         default=False,
         update=_update_enabled,
     )
+    mode: EnumProperty(
+        name="모드",
+        items=[
+            ('ACTIVE', "활성", "활성 오브젝트만 고스트 표시", 'OBJECT_DATA', 0),
+            ('SCENE', "씬", "씬의 모든 메쉬에 고스트 표시", 'SCENE_DATA', 1),
+            ('COLLECTION', "콜렉션", "콜렉션의 모든 메쉬에 고스트 표시", 'OUTLINER_COLLECTION', 2),
+        ],
+        default='ACTIVE',
+        update=_update_mode,
+    )
+    target_collection: PointerProperty(
+        type=bpy.types.Collection,
+        name="콜렉션",
+        description="어니언 스킨 대상 콜렉션",
+        update=_update_cache,
+    )
+    max_objects: IntProperty(
+        name="최대 오브젝트", default=10, min=1, max=50,
+        description="씬/콜렉션 모드에서 처리할 최대 오브젝트 수",
+        update=_update_cache,
+    )
     count_before: IntProperty(
         name="이전", default=3, min=0, max=10,
         description="현재 프레임 이전 고스트 수",
@@ -488,12 +589,12 @@ class MeshOnionSkinProps(PropertyGroup):
     )
     frame_step: IntProperty(
         name="간격", default=1, min=1, max=10,
-        description="프레임 간격 (키프레임 모드 비활성 시)",
+        description="프레임 간격",
         update=_update_cache,
     )
     use_keyframes: BoolProperty(
         name="키프레임만", default=False,
-        description="아마추어 키프레임 위치에만 고스트 표시",
+        description="아마추어 키프레임 위치에만 고스트 표시 (Active 모드 전용)",
         update=_update_cache,
     )
     color_before: FloatVectorProperty(
@@ -525,15 +626,15 @@ class MeshOnionSkinProps(PropertyGroup):
         description="페이드 커브 강도 (높을수록 가까운 고스트와 먼 고스트의 차이가 커짐)",
         update=_update_display,
     )
-    ghost_in_front: BoolProperty(
-        name="고스트 앞에 표시", default=False,
-        description="어니언 스킨 고스트를 메쉬 앞에 항상 표시",
-        update=_update_display,
-    )
-    mesh_in_front: BoolProperty(
-        name="메쉬 앞에 표시", default=False,
-        description="메쉬 오브젝트 자체를 항상 앞에 표시 (오브젝트 show_in_front 속성)",
-        update=_update_mesh_in_front,
+    in_front: EnumProperty(
+        name="앞에 표시",
+        items=[
+            ('NONE', "없음", "기본 깊이 테스트 사용"),
+            ('GHOST', "고스트", "고스트를 항상 앞에 표시"),
+            ('MESH', "메쉬", "메쉬 오브젝트를 항상 앞에 표시"),
+        ],
+        default='GHOST',
+        update=_update_in_front,
     )
     use_flat: BoolProperty(
         name="와이어프레임", default=False,
@@ -553,7 +654,7 @@ class MESH_OT_onion_skin_toggle(Operator):
 
     def execute(self, context):
         props = context.scene.mesh_onion_skin
-        props.enabled = not props.enabled  # _update_enabled 콜백이 처리
+        props.enabled = not props.enabled
         return {'FINISHED'}
 
 
@@ -563,12 +664,9 @@ class MESH_OT_onion_skin_update(Operator):
     bl_description = "어니언 스킨 캐시 강제 갱신"
 
     def execute(self, context):
-        obj = _get_target_mesh(context)
-        if obj:
-            clear_cache(obj.name)
-        else:
-            clear_cache()
-        rebuild_cache(context.scene)
+        clear_cache()
+        targets = _collect_target_meshes(context=context)
+        rebuild_cache(context.scene, targets)
         _tag_redraw(context)
         return {'FINISHED'}
 
@@ -593,25 +691,52 @@ class MESH_PT_onion_skin(Panel):
         props = context.scene.mesh_onion_skin
         layout.active = props.enabled
 
+        # 모드 선택
+        layout.prop(props, "mode", text="")
+
+        # 대상 설정 (Scene/Collection 모드에서만)
+        if props.mode != 'ACTIVE':
+            box = layout.box()
+            box.label(text="대상")
+            if props.mode == 'COLLECTION':
+                box.prop(props, "target_collection", text="")
+            box.prop(props, "max_objects")
+            targets = _collect_target_meshes(context=context)
+            count = len(targets)
+            box.label(
+                text=f"  {count}개 오브젝트",
+                icon='MESH_DATA',
+            )
+            if count >= props.max_objects:
+                box.label(
+                    text="  최대 개수 도달",
+                    icon='ERROR',
+                )
+
         # 프레임 설정
         box = layout.box()
         box.label(text="프레임")
         row = box.row(align=True)
         row.prop(props, "count_before")
         row.prop(props, "count_after")
-        box.prop(props, "use_keyframes")
-        sub = box.row()
-        sub.active = not props.use_keyframes
-        sub.prop(props, "frame_step")
-        if props.use_keyframes:
-            obj = _get_target_mesh(context)
-            if obj:
-                status, _kfs = _get_armature_keyframes(obj)
-                has_kfs = len(_kfs) > 0
-                box.label(
-                    text=f"  {status}",
-                    icon='ARMATURE_DATA' if has_kfs else 'ERROR',
-                )
+
+        if props.mode == 'ACTIVE':
+            # 키프레임: Active 모드에서만 표시
+            box.prop(props, "use_keyframes")
+            sub = box.row()
+            sub.active = not props.use_keyframes
+            sub.prop(props, "frame_step")
+            if props.use_keyframes:
+                obj = _get_target_mesh(context)
+                if obj:
+                    status, _kfs = _get_armature_keyframes(obj)
+                    has_kfs = len(_kfs) > 0
+                    box.label(
+                        text=f"  {status}",
+                        icon='ARMATURE_DATA' if has_kfs else 'ERROR',
+                    )
+        else:
+            box.prop(props, "frame_step")
 
         # 표시 설정
         box = layout.box()
@@ -621,8 +746,7 @@ class MESH_PT_onion_skin(Panel):
         sub = box.row()
         sub.active = props.use_fade
         sub.prop(props, "fade_falloff", slider=True)
-        box.prop(props, "ghost_in_front")
-        box.prop(props, "mesh_in_front")
+        box.prop(props, "in_front")
         box.prop(props, "use_flat")
 
         # 색상 설정

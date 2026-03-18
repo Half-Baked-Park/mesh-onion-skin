@@ -4,18 +4,24 @@ Onion skin addon for Blender 5.0+ — see previous and next poses as ghost overl
 
 > **[한국어 README](README_KR.md)**
 
-|Mesh|Wireframe|
-|:-:|:-:|
-|![Mesh Mode](images/fade_mode.png)|![Wireframe Mode](images/wireframe_mode.png)|
+|All Frames|Keyframe Only|Wireframe|
+|:-:|:-:|:-:|
+|![All Frames](images/01_all_frame.png)|![Keyframe Only](images/02_keyframe_only.png)|![Wireframe](images/05_wireframe.png)|
+
+|Active Mode|Scene Mode|Collection Mode|
+|:-:|:-:|:-:|
+|![Active](images/07_activemode.png)|![Scene](images/08_scenemode.png)|![Collection](images/09_collectionmode.png)|
 
 ## Features
 
+- **Three Target Modes** — Active (single object), Scene (all animated meshes), or Collection (specific group)
 - **Fast GPU Rendering** — Ghosts are rendered directly on the GPU, so animation playback stays smooth
-- **Keyframe Mode** — Toggle on to show ghosts only at keyframe positions; toggle off to show them at regular frame intervals
+- **Keyframe Mode** — Show ghosts only at keyframe positions (Active mode only)
 - **Smart Caching** — Only recalculates frames that actually changed, keeping scrubbing fast
+- **Frame-First Baking** — In multi-object modes, minimizes frame jumps by baking all objects per frame in a single pass
 - **Fade** — Ghosts further from the current frame become more transparent, with adjustable falloff
 - **Wireframe Mode** — Show ghosts as outlines instead of solid shapes, so they don't block your current pose
-- **In-Front Display** — Draw ghosts (and/or the mesh) on top of everything else in the scene
+- **In-Front Display** — Choose to draw ghosts or the mesh on top of everything else (mutually exclusive)
 - **Before / After Colors** — Set different colors for past and future ghosts
 - **Blender 5.0 Support** — Works with the new Layered Action system and older versions
 
@@ -39,20 +45,28 @@ Onion skin addon for Blender 5.0+ — see previous and next poses as ghost overl
 
 1. Select a **Mesh** or its parent **Armature**
 2. Open the **Onion Skin** sidebar tab and check **Enable**
-3. Play the animation or scrub the timeline — ghosts appear automatically
+3. Choose a **Mode** from the dropdown:
+   - **Active** — Ghosts for the selected object only
+   - **Scene** — Ghosts for all visible animated meshes in the scene
+   - **Collection** — Ghosts for all visible animated meshes in a specific collection
+4. Play the animation or scrub the timeline — ghosts appear automatically
+
+> **Collection mode note:** Make sure armatures and their child meshes are in the **same collection**. If a mesh is in Collection A but its armature is in Collection B, the ghost will appear when filtering Collection A (where the mesh lives), not Collection B.
 
 ### Panel Options
 
 | Option | Description |
 |--------|-------------|
+| **Mode** | Target mode — Active, Scene, or Collection |
+| **Collection** | Which collection to use (Collection mode only) |
+| **Max Objects** | Maximum number of objects to process (Scene/Collection modes) |
 | **Before / After** | How many ghost frames to show before and after the current frame |
-| **Keyframes Only** | Show ghosts only at keyframe positions |
-| **Step** | Frame interval between ghosts (when Keyframes Only is off) |
+| **Keyframes Only** | Show ghosts only at keyframe positions (Active mode only) |
+| **Step** | Frame interval between ghosts |
 | **Opacity** | How transparent the ghosts are |
 | **Fade** | Make ghosts further from the current frame more transparent |
 | **Fade Falloff** | How quickly the fade effect drops off |
-| **Ghost In Front** | Draw ghosts on top of all other objects |
-| **Mesh In Front** | Draw the mesh on top of all other objects |
+| **In Front** | None / Ghost (draw ghosts on top) / Mesh (draw mesh on top) |
 | **Wireframe** | Show ghosts as outlines instead of solid |
 | **Before / After Color** | Color for past and future ghosts |
 

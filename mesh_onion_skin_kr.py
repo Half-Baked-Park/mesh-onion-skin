@@ -952,13 +952,19 @@ class MESH_PT_onion_skin(Panel):
     bl_region_type = 'UI'
     bl_category = "Onion Skin"
 
-    def draw_header(self, context):
-        props = context.scene.mesh_onion_skin
-        self.layout.prop(props, "enabled", text="")
-
     def draw(self, context):
         layout = self.layout
         props = context.scene.mesh_onion_skin
+
+        # 활성화/비활성화 버튼 — enabled 상태와 무관하게 항상 활성
+        row = layout.row(align=True)
+        toggle_text = "비활성화" if props.enabled else "활성화"
+        toggle_icon = 'PAUSE' if props.enabled else 'PLAY'
+        row.operator("mesh.onion_skin_toggle", text=toggle_text,
+                     icon=toggle_icon, depress=props.enabled)
+        row.operator("mesh.onion_skin_update", text="", icon='FILE_REFRESH')
+
+        # 비활성화 시 나머지 UI 회색 처리
         layout.active = props.enabled
 
         # 모드 선택
@@ -1042,13 +1048,6 @@ class MESH_PT_onion_skin(Panel):
                 icon='SORTTIME',
             )
 
-        # 액션 버튼
-        row = layout.row(align=True)
-        toggle_text = "비활성화" if props.enabled else "활성화"
-        toggle_icon = 'PAUSE' if props.enabled else 'PLAY'
-        row.operator("mesh.onion_skin_toggle", text=toggle_text,
-                     icon=toggle_icon, depress=props.enabled)
-        row.operator("mesh.onion_skin_update", text="", icon='FILE_REFRESH')
 
 
 # ---------------------------------------------------------------------------

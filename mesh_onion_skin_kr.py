@@ -380,7 +380,7 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
             if f in existing:
                 new_cache[f] = existing[f]
             else:
-                frames_to_objects.setdefault(f, []).append(obj)
+                frames_to_objects.setdefault(f, []).append(obj.name)
         _onion_cache[obj.name] = new_cache
 
     _merged_dirty = True
@@ -447,12 +447,11 @@ def _progressive_bake_tick(generation: int) -> float | None:
                 _bake_timer_running = False
                 return None
 
-            frame, objects = _bake_queue.pop(0)
+            frame, obj_names = _bake_queue.pop(0)
             scene.frame_set(frame)
             depsgraph = bpy.context.evaluated_depsgraph_get()
-            for obj_ref in objects:
-                # stale Python 참조 방지를 위해 오브젝트 재조회
-                obj = bpy.data.objects.get(obj_ref.name)
+            for obj_name in obj_names:
+                obj = bpy.data.objects.get(obj_name)
                 if obj is None:
                     continue
                 try:
@@ -619,8 +618,11 @@ def _build_merged_batches():
 def draw_onion_skins():
     """뷰포트 드로우 콜백 — 머지드 배치 2개만 드로우 (before + after)."""
     global _merged_dirty
-    scene = bpy.context.scene
-    props = scene.mesh_onion_skin
+    try:
+        scene = bpy.context.scene
+        props = scene.mesh_onion_skin
+    except (AttributeError, RuntimeError):
+        return
     if not props.enabled:
         return
     if not _onion_cache:
@@ -1080,11 +1082,11 @@ def register():
 
 
 def unregister():
-    global _draw_handle, _rebuild_scheduled, _bake_timer_running
-    # 점진적 베이킹 타이머 정리
-    if _bake_timer_running:
-        _bake_queue.clear()
-        _bake_timer_running = False
+    global _draw_handle, _rebuild_scheduled, _bake_timer_running, _bake_generation
+    # 점진적 베이킹 타이머 정리 — 세대 증가로 pending 타이머 즉시 중단
+    _bake_generation += 1
+    _bake_queue.clear()
+    _bake_timer_running = False
     if _rebuild_scheduled:
         try:
             bpy.app.timers.unregister(_do_rebuild)

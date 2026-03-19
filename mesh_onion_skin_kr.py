@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Mesh Onion Skin",
     "author": "HB PARK",
-    "version": (1, 3, 0),
+    "version": (2, 0, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Onion Skin",
     "description": "GPU-based onion skin ghosts for 3D mesh animations",
@@ -11,6 +11,8 @@ bl_info = {
 import bpy
 import gpu
 import numpy as np
+from functools import partial
+from collections import deque
 from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty, IntProperty, FloatProperty,
@@ -24,8 +26,8 @@ from gpu_extras.batch import batch_for_shader
 # 전역 변수
 # ---------------------------------------------------------------------------
 
-# {오브젝트명: {프레임번호: GPUBatch}}
-_onion_cache: dict[str, dict[int, gpu.types.GPUBatch]] = {}
+# {오브젝트명: {프레임번호: (positions, indices)}}
+_onion_cache: dict[str, dict[int, tuple[np.ndarray, np.ndarray]]] = {}
 _draw_handle = None
 _is_baking = False
 _rebuild_scheduled = False
@@ -33,11 +35,71 @@ _pending_rebuild = None  # (scene,)
 # mesh_in_front 적용 전 원래 show_in_front 값 보존 {오브젝트명: bool}
 _original_mesh_show_in_front: dict[str, bool] = {}
 
-_PERF_WARN_THRESHOLD = 10
+# --- 점진적 베이킹 상태 ---
+_bake_queue: deque[tuple[int, list]] = deque()  # (frame, [obj_names]) 우선순위 큐
+_bake_generation: int = 0  # 세대 카운터 — 스크러빙 시 stale 작업 취소
+_bake_timer_running: bool = False
+_bake_progress: float = 0.0  # 0.0~1.0 베이킹 진행률
+_bake_total_frames: int = 0  # 현재 베이킹 작업의 총 프레임 수
+
+# --- 머지드 배치 상태 (Phase 2) ---
+_merged_before: gpu.types.GPUBatch | None = None
+_merged_after: gpu.types.GPUBatch | None = None
+_merged_dirty: bool = True
 
 
 def _get_shader():
-    return gpu.shader.from_builtin('UNIFORM_COLOR')
+    return gpu.shader.from_builtin('SMOOTH_COLOR')
+
+
+# ---------------------------------------------------------------------------
+# 프러스텀 컬링 (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _get_active_3d_view():
+    """활성 3D 뷰포트의 (region, region_3d) 반환. 없으면 (None, None)."""
+    try:
+        for area in bpy.context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for region in area.regions:
+                    if region.type == 'WINDOW':
+                        return region, area.spaces.active.region_3d
+    except Exception:
+        pass
+    return None, None
+
+
+def _extract_frustum_planes(perspective_matrix) -> np.ndarray:
+    """VP 행렬에서 6개 프러스텀 평면 추출 (Gribb-Hartmann). (6, 4) 배열 반환."""
+    m = np.array(perspective_matrix, dtype=np.float32)
+    planes = np.empty((6, 4), dtype=np.float32)
+    planes[0] = m[3] + m[0]   # Left
+    planes[1] = m[3] - m[0]   # Right
+    planes[2] = m[3] + m[1]   # Bottom
+    planes[3] = m[3] - m[1]   # Top
+    planes[4] = m[3] + m[2]   # Near
+    planes[5] = m[3] - m[2]   # Far
+    # 정규화
+    norms = np.linalg.norm(planes[:, :3], axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    planes /= norms
+    return planes
+
+
+def _is_in_frustum(obj, frustum_planes: np.ndarray) -> bool:
+    """오브젝트의 바운딩 박스가 뷰 프러스텀과 교차하는지 테스트."""
+    bb = obj.bound_box  # 로컬 좌표 8개 꼭짓점
+    mat = np.array(obj.matrix_world, dtype=np.float32)
+    corners_h = np.empty((8, 4), dtype=np.float32)
+    corners_h[:, :3] = np.array(bb, dtype=np.float32)
+    corners_h[:, 3] = 1.0
+    world = (corners_h @ mat.T)[:, :3]  # (8, 3)
+    # 8개 꼭짓점 모두 하나의 평면 바깥이면 → 프러스텀 밖
+    for i in range(6):
+        dots = world @ frustum_planes[i, :3] + frustum_planes[i, 3]
+        if np.all(dots < 0):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -118,11 +180,15 @@ def _collect_target_meshes(scene=None, context=None) -> list:
 # ---------------------------------------------------------------------------
 
 def clear_cache(obj_name: str | None = None):
-    """GPU 배치 캐시 제거."""
+    """지오메트리 캐시 제거 및 머지드 배치 무효화."""
+    global _merged_before, _merged_after, _merged_dirty
     if obj_name:
         _onion_cache.pop(obj_name, None)
     else:
         _onion_cache.clear()
+    _merged_before = None
+    _merged_after = None
+    _merged_dirty = True
 
 
 def _find_armature(obj):
@@ -220,8 +286,8 @@ def _get_target_frames(scene, props, obj) -> list[int]:
 # 베이킹
 # ---------------------------------------------------------------------------
 
-def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
-    """depsgraph가 이미 설정된 상태에서 메시 스냅샷을 GPU 배치로 반환."""
+def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool, ghost_detail: float = 1.0):
+    """메시 스냅샷의 (positions, indices) numpy 배열 반환."""
     eval_obj = obj.evaluated_get(depsgraph)
     mesh = eval_obj.to_mesh()
     if mesh is None or len(mesh.vertices) == 0:
@@ -233,11 +299,12 @@ def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
     mesh.vertices.foreach_get("co", co)
     co = co.reshape(-1, 3)
 
+    # 월드 좌표 변환 — pre-allocated homogeneous 좌표 (hstack 크래시 방지)
     mat = np.array(eval_obj.matrix_world, dtype=np.float32)
-    ones = np.ones((n, 1), dtype=np.float32)
-    co = np.ascontiguousarray((np.hstack((co, ones)) @ mat.T)[:, :3])
-
-    shader = _get_shader()
+    co_h = np.empty((n, 4), dtype=np.float32)
+    co_h[:, :3] = co
+    co_h[:, 3] = 1.0
+    co = np.ascontiguousarray((co_h @ mat.T)[:, :3])
 
     if use_flat:
         edge_n = len(mesh.edges)
@@ -246,9 +313,7 @@ def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
             return None
         idx = np.empty(edge_n * 2, dtype=np.int32)
         mesh.edges.foreach_get("vertices", idx)
-        batch = batch_for_shader(
-            shader, 'LINES', {"pos": co},
-            indices=idx.reshape(-1, 2).tolist())
+        idx = idx.reshape(-1, 2)
     else:
         mesh.calc_loop_triangles()
         tri_n = len(mesh.loop_triangles)
@@ -257,17 +322,29 @@ def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
             return None
         idx = np.empty(tri_n * 3, dtype=np.int32)
         mesh.loop_triangles.foreach_get("vertices", idx)
-        batch = batch_for_shader(
-            shader, 'TRIS', {"pos": co},
-            indices=idx.reshape(-1, 3).tolist())
+        idx = idx.reshape(-1, 3)
 
     eval_obj.to_mesh_clear()
-    return batch
+
+    # Ghost Detail — 균일 샘플링으로 삼각형/엣지 수 축소
+    if ghost_detail < 1.0 and len(idx) > 1:
+        keep = max(1, int(len(idx) * ghost_detail))
+        step = max(1, len(idx) // keep)
+        idx = idx[::step][:keep]
+
+    return (co, idx)
 
 
-def rebuild_cache(scene, targets=None):
-    """대상 오브젝트들의 어니언 스킨 캐시를 증분 빌드."""
-    global _is_baking
+def _build_prioritized_queue(current_frame: int, frames_to_objects: dict[int, list]) -> list[tuple[int, list]]:
+    """현재 프레임에 가까운 순으로 정렬. 가까운 프레임부터 베이킹."""
+    items = list(frames_to_objects.items())
+    items.sort(key=lambda pair: abs(pair[0] - current_frame))
+    return items
+
+
+def rebuild_cache(scene, targets=None, force_clear: bool = False):
+    """델타 계산 후 점진적 베이킹 큐에 등록. 논블로킹."""
+    global _bake_generation, _bake_timer_running, _bake_progress, _bake_total_frames, _merged_dirty
     if _is_baking:
         return
 
@@ -276,10 +353,14 @@ def rebuild_cache(scene, targets=None):
         return
 
     if targets is None:
-        targets = _collect_target_meshes()
+        targets = _collect_target_meshes(scene=scene)
     if not targets:
         clear_cache()
         return
+
+    # 포맷 변경 시 전체 클리어 (예: 와이어프레임 토글)
+    if force_clear:
+        clear_cache()
 
     # 유효하지 않은 캐시 정리
     valid_names = {obj.name for obj in targets}
@@ -287,66 +368,259 @@ def rebuild_cache(scene, targets=None):
     for k in stale:
         _onion_cache.pop(k, None)
 
-    # 오브젝트별 타겟 프레임 수집 + 프레임-우선 베이킹 맵 구성
-    obj_target_frames: dict[str, set[int]] = {}
+    # 오브젝트별 타겟 프레임 수집 + 델타만 베이킹 맵 구성
     frames_to_objects: dict[int, list] = {}
     for obj in targets:
         frame_list = _get_target_frames(scene, props, obj)
         if not frame_list:
             clear_cache(obj.name)
             continue
-        target_set = set(frame_list)
-        obj_target_frames[obj.name] = target_set
 
-        # 기존 캐시와 비교하여 베이킹 필요한 프레임만 수집
+        # 기존 유효 캐시 보존, 불필요 프레임 제거
         existing = _onion_cache.get(obj.name, {})
-        new_cache: dict[int, gpu.types.GPUBatch] = {}
+        new_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for f in frame_list:
             if f in existing:
                 new_cache[f] = existing[f]
             else:
-                frames_to_objects.setdefault(f, []).append(obj)
+                frames_to_objects.setdefault(f, []).append(obj.name)
         _onion_cache[obj.name] = new_cache
+
+    _merged_dirty = True
 
     if not frames_to_objects:
         return
 
-    # 프레임-우선 루프: frame_set 호출 최소화
+    # 진행 중인 베이킹 취소
+    _bake_generation += 1
+
+    # 우선순위 큐 구성 — 가까운 프레임부터
+    _bake_queue.clear()
+    _bake_queue.extend(_build_prioritized_queue(scene.frame_current, frames_to_objects))
+    _bake_total_frames = len(_bake_queue)
+    _bake_progress = 0.0
+
+    # 점진적 베이킹 타이머 시작
+    # 항상 새 타이머 등록 — 기존 타이머는 세대 불일치로 자동 중단
+    _bake_timer_running = True
+    gen = _bake_generation
+    bpy.app.timers.register(
+        partial(_progressive_bake_tick, gen),
+        first_interval=0.0,
+    )
+
+
+def _progressive_bake_tick(generation: int) -> float | None:
+    """타이머 콜백 — 틱당 N 프레임 베이킹, Blender에 제어 반환."""
+    global _is_baking, _bake_timer_running, _bake_progress, _merged_dirty
+
+    # 세대 불일치 — 중단
+    if generation != _bake_generation:
+        _bake_timer_running = False
+        return None
+
+    # 큐 비어있음 — 완료
+    if not _bake_queue:
+        _bake_timer_running = False
+        _bake_progress = 1.0
+        return None
+
+    try:
+        scene = bpy.context.scene
+        props = scene.mesh_onion_skin
+    except (AttributeError, RuntimeError):
+        _bake_timer_running = False
+        return None
+
+    if not props.enabled:
+        _bake_queue.clear()
+        _bake_timer_running = False
+        return None
+
+    # 배치 크기 결정 (틱당 프레임 수)
+    batch_size = max(1, props.bake_batch_size)
     current = scene.frame_current
     _is_baking = True
+
     try:
-        for frame in sorted(frames_to_objects.keys()):
+        frames_done = 0
+        while _bake_queue and frames_done < batch_size:
+            # 루프 내 세대 재확인
+            if generation != _bake_generation:
+                _bake_timer_running = False
+                return None
+
+            frame, obj_names = _bake_queue.popleft()
             scene.frame_set(frame)
             depsgraph = bpy.context.evaluated_depsgraph_get()
-            for obj in frames_to_objects[frame]:
-                batch = _bake_mesh_snapshot(obj, depsgraph, props.use_flat)
-                if batch is not None:
-                    _onion_cache.setdefault(obj.name, {})[frame] = batch
+            for obj_name in obj_names:
+                obj = bpy.data.objects.get(obj_name)
+                if obj is None:
+                    continue
+                try:
+                    geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat, props.ghost_detail)
+                except Exception:
+                    continue
+                if geo is not None:
+                    _onion_cache.setdefault(obj.name, {})[frame] = geo
+                    _merged_dirty = True
+            frames_done += 1
     finally:
+        # 뷰포트 깜빡임 방지를 위해 현재 프레임 복원
         try:
             scene.frame_set(current)
         except Exception:
             pass
         _is_baking = False
 
+    # 진행률 갱신
+    if _bake_total_frames > 0:
+        done = _bake_total_frames - len(_bake_queue)
+        _bake_progress = done / _bake_total_frames
+
+    # 새로 베이킹된 고스트 표시를 위해 뷰포트 리드로우 요청
+    _request_viewport_redraw()
+
+    if _bake_queue:
+        return 0.0  # 즉시 다음 틱 예약
+    else:
+        _bake_timer_running = False
+        _bake_progress = 1.0
+        return None
+
+
+def _request_viewport_redraw():
+    """모든 3D 뷰포트에 리드로우 요청."""
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
-# GPU 드로우
+# GPU 드로우 — 머지드 배치 시스템
 # ---------------------------------------------------------------------------
 
-def draw_onion_skins():
-    """뷰포트 드로우 콜백 – 캐시된 고스트 메시 렌더링."""
-    scene = bpy.context.scene
-    props = scene.mesh_onion_skin
-    if not props.enabled:
+def _build_merged_batches():
+    """캐시된 모든 고스트 지오메트리를 2개의 mega-batch로 합침 (before + after)."""
+    global _merged_before, _merged_after, _merged_dirty
+    _merged_before = None
+    _merged_after = None
+    _merged_dirty = False
+
+    if not _onion_cache:
         return
 
-    # 캐시에 있는 오브젝트만 드로우 (rebuild_cache가 이미 수집/베이킹)
-    targets = [bpy.data.objects.get(n) for n in _onion_cache if bpy.data.objects.get(n)]
-    if not targets:
+    try:
+        scene = bpy.context.scene
+        props = scene.mesh_onion_skin
+    except (AttributeError, RuntimeError):
         return
 
     current = scene.frame_current
+    use_flat = props.use_flat
+    prim_type = 'LINES' if use_flat else 'TRIS'
+
+    # 그룹별 지오메트리 수집
+    before_parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    after_parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    before_offset = 0
+    after_offset = 0
+
+    # 프러스텀 컬링 — 뷰포트 밖 오브젝트 스킵
+    frustum_planes = None
+    if props.use_frustum_cull and props.mode != 'ACTIVE':
+        _region, rv3d = _get_active_3d_view()
+        if rv3d:
+            try:
+                frustum_planes = _extract_frustum_planes(rv3d.perspective_matrix)
+            except Exception:
+                pass
+
+    def _collect_ghost_parts(frames, cache, color_rgb, offset):
+        """고스트 프레임 목록에서 (pos, vertex_color, offset_idx) 튜플 수집."""
+        parts = []
+        n = len(frames)
+        for i, frame in enumerate(frames):
+            geo = cache.get(frame)
+            if geo is None:
+                continue
+            pos, idx = geo
+            n_verts = len(pos)
+            if props.use_fade:
+                t = (i + 1) / (n + 1)
+                alpha = props.opacity * ((1.0 - t) ** props.fade_falloff)
+            else:
+                alpha = props.opacity
+            vc = np.empty((n_verts, 4), dtype=np.float32)
+            vc[:, :3] = color_rgb
+            vc[:, 3] = alpha
+            parts.append((pos, vc, idx + offset))
+            offset += n_verts
+        return parts, offset
+
+    def _finalize_batch(parts):
+        """파트를 합치고 GPU 배치 생성. 없으면 None 반환."""
+        if not parts:
+            return None
+        m_pos = np.concatenate([p[0] for p in parts])
+        m_col = np.concatenate([p[1] for p in parts])
+        m_idx = np.concatenate([p[2] for p in parts])
+        return batch_for_shader(
+            _get_shader(), prim_type,
+            {"pos": m_pos, "color": m_col},
+            indices=m_idx.tolist(),
+        )
+
+    color_before = np.array(props.color_before[:3], dtype=np.float32)
+    color_after = np.array(props.color_after[:3], dtype=np.float32)
+
+    for obj_name, cache in _onion_cache.items():
+        if not cache:
+            continue
+
+        # 프러스텀 컬링 — 카메라 밖 오브젝트 스킵
+        if frustum_planes is not None:
+            obj = bpy.data.objects.get(obj_name)
+            if obj and not _is_in_frustum(obj, frustum_planes):
+                continue
+
+        before_frames = sorted([f for f in cache if f < current], reverse=True)
+        after_frames = sorted([f for f in cache if f > current])
+
+        parts, before_offset = _collect_ghost_parts(before_frames, cache, color_before, before_offset)
+        before_parts.extend(parts)
+
+        parts, after_offset = _collect_ghost_parts(after_frames, cache, color_after, after_offset)
+        after_parts.extend(parts)
+
+    _merged_before = _finalize_batch(before_parts)
+    _merged_after = _finalize_batch(after_parts)
+
+
+def draw_onion_skins():
+    """뷰포트 드로우 콜백 — 머지드 배치 2개만 드로우 (before + after)."""
+    global _merged_dirty
+    try:
+        scene = bpy.context.scene
+        props = scene.mesh_onion_skin
+    except (AttributeError, RuntimeError):
+        return
+    if not props.enabled:
+        return
+    if not _onion_cache:
+        return
+
+    # 지오메트리나 디스플레이 설정 변경 시 머지드 배치 재빌드
+    if _merged_dirty:
+        _build_merged_batches()
+
+    if _merged_before is None and _merged_after is None:
+        return
+
     shader = _get_shader()
 
     gpu.state.blend_set('ALPHA')
@@ -360,29 +634,10 @@ def draw_onion_skins():
 
     shader.bind()
 
-    def _draw_group(frames, color_rgb, cache):
-        n = len(frames)
-        for i, frame in enumerate(frames):
-            batch = cache.get(frame)
-            if batch is None:
-                continue
-            if props.use_fade:
-                t = (i + 1) / (n + 1)
-                factor = (1.0 - t) ** props.fade_falloff
-                alpha = props.opacity * factor
-            else:
-                alpha = props.opacity
-            shader.uniform_float("color", (*color_rgb[:3], alpha))
-            batch.draw(shader)
-
-    for obj in targets:
-        cache = _onion_cache.get(obj.name)
-        if not cache:
-            continue
-        before_sorted = sorted([f for f in cache if f < current], reverse=True)
-        after_sorted  = sorted([f for f in cache if f > current])
-        _draw_group(before_sorted, props.color_before, cache)
-        _draw_group(after_sorted,  props.color_after, cache)
+    if _merged_before is not None:
+        _merged_before.draw(shader)
+    if _merged_after is not None:
+        _merged_after.draw(shader)
 
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('NONE')
@@ -397,6 +652,7 @@ def draw_onion_skins():
 
 @persistent
 def _on_frame_change(scene, depsgraph):
+    global _merged_dirty
     if _is_baking:
         return
     try:
@@ -407,14 +663,8 @@ def _on_frame_change(scene, depsgraph):
         return
     targets = _collect_target_meshes(scene=scene)
     rebuild_cache(scene, targets)
-    # 캐시 갱신 후 뷰포트 리드로우 요청
-    try:
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.tag_redraw()
-    except Exception:
-        pass
+    _merged_dirty = True  # 알파 값이 현재 프레임에 따라 변경됨
+    _request_viewport_redraw()
 
 
 @persistent
@@ -433,34 +683,28 @@ def _do_rebuild():
     _pending_rebuild = None
     if data is None:
         return None
-    scene, targets = data
+    scene, targets, force_clear = data
     try:
         props = scene.mesh_onion_skin
     except AttributeError:
         return None
     if not props.enabled:
         return None
-    rebuild_cache(scene, targets)
-    try:
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.tag_redraw()
-    except Exception:
-        pass
+    rebuild_cache(scene, targets, force_clear=force_clear)
+    _request_viewport_redraw()
     return None
 
 
-def _schedule_rebuild(context=None):
+def _schedule_rebuild(context=None, force_clear: bool = False):
+    """다음 타이머 틱에 리빌드 예약. 기본적으로 캐시를 클리어하지 않음."""
     global _rebuild_scheduled, _pending_rebuild
-    clear_cache()
     try:
         scene = context.scene if context else bpy.context.scene
     except AttributeError:
         return
     # 유효한 context가 있을 때 타겟을 미리 캡처
     targets = _collect_target_meshes(scene=scene, context=context)
-    _pending_rebuild = (scene, targets)
+    _pending_rebuild = (scene, targets, force_clear)
     if not _rebuild_scheduled:
         _rebuild_scheduled = True
         bpy.app.timers.register(_do_rebuild, first_interval=0.0)
@@ -469,13 +713,6 @@ def _schedule_rebuild(context=None):
 # ---------------------------------------------------------------------------
 # 프로퍼티 업데이트 콜백
 # ---------------------------------------------------------------------------
-
-def _tag_redraw(context):
-    if context and context.screen:
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
-
 
 def _clear_fcurve_if_present(scene, data_path: str):
     """씬 액션에서 해당 경로의 fcurve를 제거한다. frame_set() 중 덮어쓰기 방지용."""
@@ -501,35 +738,54 @@ def _clear_fcurve_if_present(scene, data_path: str):
         pass
 
 
-def _update_cache(self, context):
-    # frame_set() 중 키프레임 데이터가 값을 덮어쓰는 것 방지: 관련 fcurve 제거
+_ONION_FCURVE_PATHS = (
+    'mesh_onion_skin.use_keyframes',
+    'mesh_onion_skin.use_flat',
+    'mesh_onion_skin.mode',
+)
+
+
+def _clear_onion_fcurves(context):
+    """frame_set() 중 프로퍼티 값 덮어쓰기 방지를 위해 어니언 스킨 fcurve 제거."""
     scene = context.scene if context else bpy.context.scene
-    _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_keyframes')
-    _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_flat')
-    _clear_fcurve_if_present(scene, 'mesh_onion_skin.mode')
+    for path in _ONION_FCURVE_PATHS:
+        _clear_fcurve_if_present(scene, path)
+
+
+def _update_cache(self, context):
+    """증분 리빌드 — 겹치는 캐시 프레임 재활용."""
+    _clear_onion_fcurves(context)
     _schedule_rebuild(context)
-    _tag_redraw(context)
+    _request_viewport_redraw()
+
+
+def _update_cache_full(self, context):
+    """전체 리빌드 — 포맷 변경 시 전체 캐시 클리어 (와이어프레임 토글 등)."""
+    _clear_onion_fcurves(context)
+    _schedule_rebuild(context, force_clear=True)
+    _request_viewport_redraw()
 
 
 def _update_mode(self, context):
-    """모드 전환 시 – 캐시 클리어 + 리빌드."""
-    _schedule_rebuild(context)
-    _tag_redraw(context)
+    """모드 전환 시 – 전체 클리어 + 리빌드 (타겟 세트 완전 변경)."""
+    _schedule_rebuild(context, force_clear=True)
+    _request_viewport_redraw()
 
 
 def _update_enabled(self, context):
     """활성화 토글 시 – 헤더 체크박스와 오퍼레이터 버튼 모두 동작."""
     if self.enabled:
-        _schedule_rebuild(context)
+        _schedule_rebuild(context, force_clear=True)
     else:
-    
         clear_cache()
-    _tag_redraw(context)
+    _request_viewport_redraw()
 
 
 def _update_display(self, context):
-    """드로우만 갱신하면 되는 설정 변경 시."""
-    _tag_redraw(context)
+    """드로우만 갱신하면 되는 설정 변경 시 (색상, 불투명도, 페이드)."""
+    global _merged_dirty
+    _merged_dirty = True  # 색상/불투명도가 per-vertex 데이터에 반영됨
+    _request_viewport_redraw()
 
 
 def _update_in_front(self, context):
@@ -542,7 +798,7 @@ def _update_in_front(self, context):
             obj.show_in_front = True
         else:
             obj.show_in_front = _original_mesh_show_in_front.pop(obj.name, False)
-    _tag_redraw(context)
+    _request_viewport_redraw()
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +829,7 @@ class MeshOnionSkinProps(PropertyGroup):
         update=_update_cache,
     )
     max_objects: IntProperty(
-        name="최대 오브젝트", default=10, min=1, max=50,
+        name="최대 오브젝트", default=10, min=1, max=500,
         description="씬/콜렉션 모드에서 처리할 최대 오브젝트 수",
         update=_update_cache,
     )
@@ -595,7 +851,7 @@ class MeshOnionSkinProps(PropertyGroup):
     use_keyframes: BoolProperty(
         name="키프레임만", default=False,
         description="아마추어 키프레임 위치에만 고스트 표시 (Active 모드 전용)",
-        update=_update_cache,
+        update=_update_cache_full,
     )
     color_before: FloatVectorProperty(
         name="이전 색상", subtype='COLOR_GAMMA',
@@ -639,7 +895,22 @@ class MeshOnionSkinProps(PropertyGroup):
     use_flat: BoolProperty(
         name="와이어프레임", default=False,
         description="와이어프레임으로 고스트 표시",
-        update=_update_cache,
+        update=_update_cache_full,
+    )
+    bake_batch_size: IntProperty(
+        name="베이크 배치", default=2, min=1, max=10,
+        description="타이머 틱당 베이킹할 프레임 수 (높을수록 빠르지만 버벅임 증가)",
+    )
+    use_frustum_cull: BoolProperty(
+        name="화면 밖 스킵", default=True,
+        description="카메라 밖 오브젝트의 고스트 드로우 스킵",
+        update=_update_display,
+    )
+    ghost_detail: FloatProperty(
+        name="고스트 디테일", default=1.0, min=0.05, max=1.0,
+        subtype='FACTOR',
+        description="고스트 삼각형 수 축소로 성능 향상 (낮을수록 삼각형 적음)",
+        update=_update_cache_full,
     )
 
 
@@ -664,10 +935,9 @@ class MESH_OT_onion_skin_update(Operator):
     bl_description = "어니언 스킨 캐시 강제 갱신"
 
     def execute(self, context):
-        clear_cache()
         targets = _collect_target_meshes(context=context)
-        rebuild_cache(context.scene, targets)
-        _tag_redraw(context)
+        rebuild_cache(context.scene, targets, force_clear=True)
+        _request_viewport_redraw()
         return {'FINISHED'}
 
 
@@ -682,14 +952,24 @@ class MESH_PT_onion_skin(Panel):
     bl_region_type = 'UI'
     bl_category = "Onion Skin"
 
-    def draw_header(self, context):
-        props = context.scene.mesh_onion_skin
-        self.layout.prop(props, "enabled", text="")
-
     def draw(self, context):
         layout = self.layout
         props = context.scene.mesh_onion_skin
-        layout.active = props.enabled
+
+        # 활성화/비활성화 버튼 — enabled 상태와 무관하게 항상 활성
+        header = layout.column()
+        header.active = True
+        row = header.row(align=True)
+        toggle_text = "비활성화" if props.enabled else "활성화"
+        toggle_icon = 'PAUSE' if props.enabled else 'PLAY'
+        row.operator("mesh.onion_skin_toggle", text=toggle_text,
+                     icon=toggle_icon, depress=props.enabled)
+        row.operator("mesh.onion_skin_update", text="", icon='FILE_REFRESH')
+
+        # 비활성화 시 나머지 UI 회색 처리
+        col = layout.column()
+        col.active = props.enabled
+        layout = col
 
         # 모드 선택
         layout.prop(props, "mode", text="")
@@ -756,13 +1036,22 @@ class MESH_PT_onion_skin(Panel):
         row.prop(props, "color_before", text="")
         row.prop(props, "color_after", text="")
 
-        # 액션 버튼
-        row = layout.row(align=True)
-        toggle_text = "비활성화" if props.enabled else "활성화"
-        toggle_icon = 'PAUSE' if props.enabled else 'PLAY'
-        row.operator("mesh.onion_skin_toggle", text=toggle_text,
-                     icon=toggle_icon, depress=props.enabled)
-        row.operator("mesh.onion_skin_update", text="", icon='FILE_REFRESH')
+        # 성능 설정 (Scene/Collection 모드에서만)
+        if props.mode != 'ACTIVE':
+            box = layout.box()
+            box.label(text="성능")
+            box.prop(props, "ghost_detail", slider=True)
+            box.prop(props, "bake_batch_size")
+            box.prop(props, "use_frustum_cull")
+
+        # 베이킹 진행률 표시
+        if _bake_timer_running:
+            box = layout.box()
+            box.label(
+                text=f"베이킹 중... {_bake_progress:.0%}",
+                icon='SORTTIME',
+            )
+
 
 
 # ---------------------------------------------------------------------------
@@ -790,7 +1079,11 @@ def register():
 
 
 def unregister():
-    global _draw_handle, _rebuild_scheduled
+    global _draw_handle, _rebuild_scheduled, _bake_timer_running, _bake_generation
+    # 점진적 베이킹 타이머 정리 — 세대 증가로 pending 타이머 즉시 중단
+    _bake_generation += 1
+    _bake_queue.clear()
+    _bake_timer_running = False
     if _rebuild_scheduled:
         try:
             bpy.app.timers.unregister(_do_rebuild)

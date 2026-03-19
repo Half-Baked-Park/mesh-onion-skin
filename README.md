@@ -4,6 +4,8 @@ Onion skin addon for Blender 5.0+ — see previous and next poses as ghost overl
 
 > **[한국어 README](README_KR.md)**
 
+![v2.0 — Massively increased object processing limit](images/updated.png)
+
 |All Frames|Keyframe Only|
 |:-:|:-:|
 |![All Frames](images/01_all_frame.png)|![Keyframe Only](images/02_keyframe_only.png)|
@@ -16,13 +18,23 @@ Onion skin addon for Blender 5.0+ — see previous and next poses as ghost overl
 |:-:|:-:|:-:|
 |![Active](images/07_activemode.png)|![Scene](images/08_scenemode.png)|![Collection](images/09_collectionmode.png)|
 
+## What's New in v2.0
+
+The maximum object limit has been raised from **50 to 500**, with new performance options to keep things smooth at scale.
+
+| Option | Description |
+|--------|-------------|
+| **Ghost Detail** | Reduce ghost triangle count for lighter rendering (slider, 5%–100%) |
+| **Bake Batch** | How many frames to bake per tick — higher = faster bake, more stutter |
+| **Off-Screen Skip** | Skip drawing ghosts for objects outside the camera view |
+
 ## Features
 
 - **Three Target Modes** — Active (single object), Scene (all animated meshes), or Collection (specific group)
-- **Fast GPU Rendering** — Ghosts are rendered directly on the GPU, so animation playback stays smooth
+- **Fast GPU Rendering** — All ghosts are merged into 2 draw calls, so animation playback stays smooth even with hundreds of objects
+- **Progressive Baking** — Ghosts bake in the background without freezing the viewport, closest frames first
 - **Keyframe Mode** — Show ghosts only at keyframe positions (Active mode only)
 - **Smart Caching** — Only recalculates frames that actually changed, keeping scrubbing fast
-- **Frame-First Baking** — In multi-object modes, minimizes frame jumps by baking all objects per frame in a single pass
 - **Fade** — Ghosts further from the current frame become more transparent, with adjustable falloff
 - **Wireframe Mode** — Show ghosts as outlines instead of solid shapes, so they don't block your current pose
 - **In-Front Display** — Choose to draw ghosts or the mesh on top of everything else (mutually exclusive)
@@ -73,6 +85,9 @@ Onion skin addon for Blender 5.0+ — see previous and next poses as ghost overl
 | **In Front** | None / Ghost (draw ghosts on top) / Mesh (draw mesh on top) |
 | **Wireframe** | Show ghosts as outlines instead of solid |
 | **Before / After Color** | Color for past and future ghosts |
+| **Ghost Detail** | Reduce ghost triangle count for performance (Scene/Collection modes) |
+| **Bake Batch** | Frames to bake per timer tick (Scene/Collection modes) |
+| **Off-Screen Skip** | Skip ghosts for objects outside the camera view (Scene/Collection modes) |
 
 ## License
 

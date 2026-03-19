@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Mesh Onion Skin",
     "author": "HB PARK",
-    "version": (1, 3, 0),
+    "version": (2, 0, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Onion Skin",
     "description": "GPU-based onion skin ghosts for 3D mesh animations",
@@ -11,6 +11,7 @@ bl_info = {
 import bpy
 import gpu
 import numpy as np
+import functools
 from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty, IntProperty, FloatProperty,
@@ -24,8 +25,8 @@ from gpu_extras.batch import batch_for_shader
 # Global variables
 # ---------------------------------------------------------------------------
 
-# {object_name: {frame_number: GPUBatch}}
-_onion_cache: dict[str, dict[int, gpu.types.GPUBatch]] = {}
+# {object_name: {frame_number: (positions, indices)}}
+_onion_cache: dict[str, dict[int, tuple[np.ndarray, np.ndarray]]] = {}
 _draw_handle = None
 _is_baking = False
 _rebuild_scheduled = False
@@ -35,9 +36,21 @@ _original_mesh_show_in_front: dict[str, bool] = {}
 
 _PERF_WARN_THRESHOLD = 10
 
+# --- Progressive baking state ---
+_bake_queue: list[tuple[int, list]] = []  # (frame, [objects]) 우선순위 큐
+_bake_generation: int = 0  # 세대 카운터 — 스크러빙 시 stale 작업 취소
+_bake_timer_running: bool = False
+_bake_progress: float = 0.0  # 0.0~1.0 베이킹 진행률
+_bake_total_frames: int = 0  # 현재 베이킹 작업의 총 프레임 수
+
+# --- Merged batch state (Phase 2) ---
+_merged_before: gpu.types.GPUBatch | None = None
+_merged_after: gpu.types.GPUBatch | None = None
+_merged_dirty: bool = True
+
 
 def _get_shader():
-    return gpu.shader.from_builtin('UNIFORM_COLOR')
+    return gpu.shader.from_builtin('SMOOTH_COLOR')
 
 
 # ---------------------------------------------------------------------------
@@ -118,11 +131,15 @@ def _collect_target_meshes(scene=None, context=None) -> list:
 # ---------------------------------------------------------------------------
 
 def clear_cache(obj_name: str | None = None):
-    """Remove GPU batch cache."""
+    """Remove geometry cache and invalidate merged batches."""
+    global _merged_before, _merged_after, _merged_dirty
     if obj_name:
         _onion_cache.pop(obj_name, None)
     else:
         _onion_cache.clear()
+    _merged_before = None
+    _merged_after = None
+    _merged_dirty = True
 
 
 def _find_armature(obj):
@@ -221,7 +238,7 @@ def _get_target_frames(scene, props, obj) -> list[int]:
 # ---------------------------------------------------------------------------
 
 def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
-    """Return a GPU batch snapshot of the mesh with depsgraph already set."""
+    """Return (positions, indices) numpy arrays for the mesh snapshot."""
     eval_obj = obj.evaluated_get(depsgraph)
     mesh = eval_obj.to_mesh()
     if mesh is None or len(mesh.vertices) == 0:
@@ -233,11 +250,12 @@ def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
     mesh.vertices.foreach_get("co", co)
     co = co.reshape(-1, 3)
 
+    # World-space transform — pre-allocated homogeneous coordinates (avoids hstack crash)
     mat = np.array(eval_obj.matrix_world, dtype=np.float32)
-    ones = np.ones((n, 1), dtype=np.float32)
-    co = np.ascontiguousarray((np.hstack((co, ones)) @ mat.T)[:, :3])
-
-    shader = _get_shader()
+    co_h = np.empty((n, 4), dtype=np.float32)
+    co_h[:, :3] = co
+    co_h[:, 3] = 1.0
+    co = np.ascontiguousarray((co_h @ mat.T)[:, :3])
 
     if use_flat:
         edge_n = len(mesh.edges)
@@ -246,9 +264,7 @@ def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
             return None
         idx = np.empty(edge_n * 2, dtype=np.int32)
         mesh.edges.foreach_get("vertices", idx)
-        batch = batch_for_shader(
-            shader, 'LINES', {"pos": co},
-            indices=idx.reshape(-1, 2).tolist())
+        idx = idx.reshape(-1, 2)
     else:
         mesh.calc_loop_triangles()
         tri_n = len(mesh.loop_triangles)
@@ -257,17 +273,22 @@ def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
             return None
         idx = np.empty(tri_n * 3, dtype=np.int32)
         mesh.loop_triangles.foreach_get("vertices", idx)
-        batch = batch_for_shader(
-            shader, 'TRIS', {"pos": co},
-            indices=idx.reshape(-1, 3).tolist())
+        idx = idx.reshape(-1, 3)
 
     eval_obj.to_mesh_clear()
-    return batch
+    return (co, idx)
 
 
-def rebuild_cache(scene, targets=None):
-    """Incrementally build the onion skin cache for target objects."""
-    global _is_baking
+def _build_prioritized_queue(current_frame: int, frames_to_objects: dict[int, list]) -> list[tuple[int, list]]:
+    """Sort frames by proximity to current frame. Closest frames bake first."""
+    items = list(frames_to_objects.items())
+    items.sort(key=lambda pair: abs(pair[0] - current_frame))
+    return items
+
+
+def rebuild_cache(scene, targets=None, force_clear: bool = False):
+    """Compute delta and enqueue progressive baking. Non-blocking."""
+    global _bake_generation, _bake_timer_running, _bake_progress, _bake_total_frames, _merged_dirty
     if _is_baking:
         return
 
@@ -281,26 +302,27 @@ def rebuild_cache(scene, targets=None):
         clear_cache()
         return
 
+    # Full clear when format changes (e.g. wireframe toggle)
+    if force_clear:
+        clear_cache()
+
     # Evict stale cache entries
     valid_names = {obj.name for obj in targets}
     stale = [k for k in _onion_cache if k not in valid_names]
     for k in stale:
         _onion_cache.pop(k, None)
 
-    # Collect per-object target frames + build frame-first baking map
-    obj_target_frames: dict[str, set[int]] = {}
+    # Collect per-object target frames + build frame-first baking map (delta only)
     frames_to_objects: dict[int, list] = {}
     for obj in targets:
         frame_list = _get_target_frames(scene, props, obj)
         if not frame_list:
             clear_cache(obj.name)
             continue
-        target_set = set(frame_list)
-        obj_target_frames[obj.name] = target_set
 
-        # Compare with existing cache, collect only frames that need baking
+        # Preserve existing valid cache entries, evict frames no longer needed
         existing = _onion_cache.get(obj.name, {})
-        new_cache: dict[int, gpu.types.GPUBatch] = {}
+        new_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for f in frame_list:
             if f in existing:
                 new_cache[f] = existing[f]
@@ -308,45 +330,240 @@ def rebuild_cache(scene, targets=None):
                 frames_to_objects.setdefault(f, []).append(obj)
         _onion_cache[obj.name] = new_cache
 
+    _merged_dirty = True
+
     if not frames_to_objects:
         return
 
-    # Frame-first loop: minimize frame_set calls
+    # Cancel any in-progress bake
+    _bake_generation += 1
+
+    # Build priority queue — closest frames first
+    _bake_queue.clear()
+    _bake_queue.extend(_build_prioritized_queue(scene.frame_current, frames_to_objects))
+    _bake_total_frames = len(_bake_queue)
+    _bake_progress = 0.0
+
+    # Start progressive bake timer
+    # Always register a new timer — old one will self-abort on generation mismatch
+    _bake_timer_running = True
+    gen = _bake_generation
+    bpy.app.timers.register(
+        functools.partial(_progressive_bake_tick, gen),
+        first_interval=0.0,
+    )
+
+
+def _progressive_bake_tick(generation: int) -> float | None:
+    """Timer callback — bakes N frames per tick, yields back to Blender."""
+    global _is_baking, _bake_timer_running, _bake_progress, _merged_dirty
+
+    # Stale generation — abort
+    if generation != _bake_generation:
+        _bake_timer_running = False
+        return None
+
+    # Nothing left — done
+    if not _bake_queue:
+        _bake_timer_running = False
+        _bake_progress = 1.0
+        return None
+
+    try:
+        scene = bpy.context.scene
+        props = scene.mesh_onion_skin
+    except (AttributeError, RuntimeError):
+        _bake_timer_running = False
+        return None
+
+    if not props.enabled:
+        _bake_queue.clear()
+        _bake_timer_running = False
+        return None
+
+    # Determine batch size (frames per tick)
+    batch_size = max(1, getattr(props, 'bake_batch_size', 2))
     current = scene.frame_current
     _is_baking = True
+
     try:
-        for frame in sorted(frames_to_objects.keys()):
+        frames_done = 0
+        while _bake_queue and frames_done < batch_size:
+            # Re-check generation inside loop
+            if generation != _bake_generation:
+                _bake_timer_running = False
+                return None
+
+            frame, objects = _bake_queue.pop(0)
             scene.frame_set(frame)
             depsgraph = bpy.context.evaluated_depsgraph_get()
-            for obj in frames_to_objects[frame]:
-                batch = _bake_mesh_snapshot(obj, depsgraph, props.use_flat)
-                if batch is not None:
-                    _onion_cache.setdefault(obj.name, {})[frame] = batch
+            for obj_ref in objects:
+                # Re-fetch object to avoid stale Python references
+                obj = bpy.data.objects.get(obj_ref.name)
+                if obj is None:
+                    continue
+                try:
+                    geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat)
+                except Exception:
+                    continue
+                if geo is not None:
+                    _onion_cache.setdefault(obj.name, {})[frame] = geo
+                    _merged_dirty = True
+            frames_done += 1
     finally:
+        # Restore current frame to prevent viewport flicker
         try:
             scene.frame_set(current)
         except Exception:
             pass
         _is_baking = False
 
+    # Update progress
+    if _bake_total_frames > 0:
+        done = _bake_total_frames - len(_bake_queue)
+        _bake_progress = done / _bake_total_frames
+
+    # Request viewport redraw to show newly baked ghosts
+    _request_viewport_redraw()
+
+    if _bake_queue:
+        return 0.0  # re-schedule immediately for next tick
+    else:
+        _bake_timer_running = False
+        _bake_progress = 1.0
+        return None
+
+
+def _request_viewport_redraw():
+    """Request redraw for all 3D viewports."""
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
-# GPU draw
+# GPU draw — merged batch system
 # ---------------------------------------------------------------------------
+
+def _build_merged_batches():
+    """Merge all cached ghost geometry into 2 mega-batches (before + after current frame)."""
+    global _merged_before, _merged_after, _merged_dirty
+    _merged_before = None
+    _merged_after = None
+    _merged_dirty = False
+
+    if not _onion_cache:
+        return
+
+    try:
+        scene = bpy.context.scene
+        props = scene.mesh_onion_skin
+    except (AttributeError, RuntimeError):
+        return
+
+    current = scene.frame_current
+    use_flat = props.use_flat
+    prim_type = 'LINES' if use_flat else 'TRIS'
+
+    # Collect geometry per group
+    before_parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    after_parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    before_offset = 0
+    after_offset = 0
+
+    for obj_name, cache in _onion_cache.items():
+        if not cache:
+            continue
+
+        before_frames = sorted([f for f in cache if f < current], reverse=True)
+        after_frames = sorted([f for f in cache if f > current])
+
+        # Before ghosts
+        n_before = len(before_frames)
+        for i, frame in enumerate(before_frames):
+            geo = cache.get(frame)
+            if geo is None:
+                continue
+            pos, idx = geo
+            n_verts = len(pos)
+            if props.use_fade:
+                t = (i + 1) / (n_before + 1)
+                alpha = props.opacity * ((1.0 - t) ** props.fade_falloff)
+            else:
+                alpha = props.opacity
+            vc = np.empty((n_verts, 4), dtype=np.float32)
+            vc[:, 0] = props.color_before[0]
+            vc[:, 1] = props.color_before[1]
+            vc[:, 2] = props.color_before[2]
+            vc[:, 3] = alpha
+            before_parts.append((pos, vc, idx + before_offset))
+            before_offset += n_verts
+
+        # After ghosts
+        n_after = len(after_frames)
+        for i, frame in enumerate(after_frames):
+            geo = cache.get(frame)
+            if geo is None:
+                continue
+            pos, idx = geo
+            n_verts = len(pos)
+            if props.use_fade:
+                t = (i + 1) / (n_after + 1)
+                alpha = props.opacity * ((1.0 - t) ** props.fade_falloff)
+            else:
+                alpha = props.opacity
+            vc = np.empty((n_verts, 4), dtype=np.float32)
+            vc[:, 0] = props.color_after[0]
+            vc[:, 1] = props.color_after[1]
+            vc[:, 2] = props.color_after[2]
+            vc[:, 3] = alpha
+            after_parts.append((pos, vc, idx + after_offset))
+            after_offset += n_verts
+
+    shader = _get_shader()
+
+    if before_parts:
+        m_pos = np.concatenate([p[0] for p in before_parts])
+        m_col = np.concatenate([p[1] for p in before_parts])
+        m_idx = np.concatenate([p[2] for p in before_parts])
+        _merged_before = batch_for_shader(
+            shader, prim_type,
+            {"pos": m_pos, "color": m_col},
+            indices=m_idx.tolist(),
+        )
+
+    if after_parts:
+        m_pos = np.concatenate([p[0] for p in after_parts])
+        m_col = np.concatenate([p[1] for p in after_parts])
+        m_idx = np.concatenate([p[2] for p in after_parts])
+        _merged_after = batch_for_shader(
+            shader, prim_type,
+            {"pos": m_pos, "color": m_col},
+            indices=m_idx.tolist(),
+        )
+
 
 def draw_onion_skins():
-    """Viewport draw callback — renders cached ghost meshes."""
+    """Viewport draw callback — renders 2 merged batches (before + after)."""
+    global _merged_dirty
     scene = bpy.context.scene
     props = scene.mesh_onion_skin
     if not props.enabled:
         return
-
-    # Draw only objects already in cache (rebuild_cache handles collection/baking)
-    targets = [bpy.data.objects.get(n) for n in _onion_cache if bpy.data.objects.get(n)]
-    if not targets:
+    if not _onion_cache:
         return
 
-    current = scene.frame_current
+    # Rebuild merged batches if geometry or display settings changed
+    if _merged_dirty:
+        _build_merged_batches()
+
+    if _merged_before is None and _merged_after is None:
+        return
+
     shader = _get_shader()
 
     gpu.state.blend_set('ALPHA')
@@ -360,29 +577,10 @@ def draw_onion_skins():
 
     shader.bind()
 
-    def _draw_group(frames, color_rgb, cache):
-        n = len(frames)
-        for i, frame in enumerate(frames):
-            batch = cache.get(frame)
-            if batch is None:
-                continue
-            if props.use_fade:
-                t = (i + 1) / (n + 1)
-                factor = (1.0 - t) ** props.fade_falloff
-                alpha = props.opacity * factor
-            else:
-                alpha = props.opacity
-            shader.uniform_float("color", (*color_rgb[:3], alpha))
-            batch.draw(shader)
-
-    for obj in targets:
-        cache = _onion_cache.get(obj.name)
-        if not cache:
-            continue
-        before_sorted = sorted([f for f in cache if f < current], reverse=True)
-        after_sorted  = sorted([f for f in cache if f > current])
-        _draw_group(before_sorted, props.color_before, cache)
-        _draw_group(after_sorted,  props.color_after, cache)
+    if _merged_before is not None:
+        _merged_before.draw(shader)
+    if _merged_after is not None:
+        _merged_after.draw(shader)
 
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('NONE')
@@ -397,6 +595,7 @@ def draw_onion_skins():
 
 @persistent
 def _on_frame_change(scene, depsgraph):
+    global _merged_dirty
     if _is_baking:
         return
     try:
@@ -407,14 +606,8 @@ def _on_frame_change(scene, depsgraph):
         return
     targets = _collect_target_meshes(scene=scene)
     rebuild_cache(scene, targets)
-    # Request viewport redraw after cache update
-    try:
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.tag_redraw()
-    except Exception:
-        pass
+    _merged_dirty = True  # Alpha values depend on current frame
+    _request_viewport_redraw()
 
 
 @persistent
@@ -433,34 +626,28 @@ def _do_rebuild():
     _pending_rebuild = None
     if data is None:
         return None
-    scene, targets = data
+    scene, targets, force_clear = data
     try:
         props = scene.mesh_onion_skin
     except AttributeError:
         return None
     if not props.enabled:
         return None
-    rebuild_cache(scene, targets)
-    try:
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.tag_redraw()
-    except Exception:
-        pass
+    rebuild_cache(scene, targets, force_clear=force_clear)
+    _request_viewport_redraw()
     return None
 
 
-def _schedule_rebuild(context=None):
+def _schedule_rebuild(context=None, force_clear: bool = False):
+    """Schedule a rebuild on the next timer tick. Does NOT clear cache by default."""
     global _rebuild_scheduled, _pending_rebuild
-    clear_cache()
     try:
         scene = context.scene if context else bpy.context.scene
     except AttributeError:
         return
     # Capture targets now while context is valid
     targets = _collect_target_meshes(scene=scene, context=context)
-    _pending_rebuild = (scene, targets)
+    _pending_rebuild = (scene, targets, force_clear)
     if not _rebuild_scheduled:
         _rebuild_scheduled = True
         bpy.app.timers.register(_do_rebuild, first_interval=0.0)
@@ -502,7 +689,7 @@ def _clear_fcurve_if_present(scene, data_path: str):
 
 
 def _update_cache(self, context):
-    # Prevent keyframe data from overwriting values during frame_set(): remove relevant fcurves
+    """Incremental rebuild — reuses overlapping cached frames."""
     scene = context.scene if context else bpy.context.scene
     _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_keyframes')
     _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_flat')
@@ -511,24 +698,35 @@ def _update_cache(self, context):
     _tag_redraw(context)
 
 
+def _update_cache_full(self, context):
+    """Full rebuild — clears all cache (for format changes like wireframe toggle)."""
+    scene = context.scene if context else bpy.context.scene
+    _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_keyframes')
+    _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_flat')
+    _clear_fcurve_if_present(scene, 'mesh_onion_skin.mode')
+    _schedule_rebuild(context, force_clear=True)
+    _tag_redraw(context)
+
+
 def _update_mode(self, context):
-    """On mode switch — clear cache and rebuild."""
-    _schedule_rebuild(context)
+    """On mode switch — full clear and rebuild (target set changes completely)."""
+    _schedule_rebuild(context, force_clear=True)
     _tag_redraw(context)
 
 
 def _update_enabled(self, context):
     """On enable toggle — works for both the header checkbox and operator button."""
     if self.enabled:
-        _schedule_rebuild(context)
+        _schedule_rebuild(context, force_clear=True)
     else:
-    
         clear_cache()
     _tag_redraw(context)
 
 
 def _update_display(self, context):
-    """For settings that only need a redraw."""
+    """For settings that only need a redraw (color, opacity, fade change)."""
+    global _merged_dirty
+    _merged_dirty = True  # Colors/opacity baked into per-vertex data
     _tag_redraw(context)
 
 
@@ -573,7 +771,7 @@ class MeshOnionSkinProps(PropertyGroup):
         update=_update_cache,
     )
     max_objects: IntProperty(
-        name="Max Objects", default=10, min=1, max=50,
+        name="Max Objects", default=10, min=1, max=500,
         description="Maximum number of objects to process in Scene/Collection mode",
         update=_update_cache,
     )
@@ -595,7 +793,7 @@ class MeshOnionSkinProps(PropertyGroup):
     use_keyframes: BoolProperty(
         name="Keyframes Only", default=False,
         description="Show ghosts only at armature keyframe positions (Active mode only)",
-        update=_update_cache,
+        update=_update_cache_full,
     )
     color_before: FloatVectorProperty(
         name="Before Color", subtype='COLOR_GAMMA',
@@ -639,7 +837,11 @@ class MeshOnionSkinProps(PropertyGroup):
     use_flat: BoolProperty(
         name="Wireframe", default=False,
         description="Display ghosts as wireframe",
-        update=_update_cache,
+        update=_update_cache_full,
+    )
+    bake_batch_size: IntProperty(
+        name="Bake Batch", default=2, min=1, max=10,
+        description="Frames to bake per timer tick (higher = faster bake, more stutter)",
     )
 
 
@@ -664,9 +866,8 @@ class MESH_OT_onion_skin_update(Operator):
     bl_description = "Force rebuild the onion skin cache"
 
     def execute(self, context):
-        clear_cache()
         targets = _collect_target_meshes(context=context)
-        rebuild_cache(context.scene, targets)
+        rebuild_cache(context.scene, targets, force_clear=True)
         _tag_redraw(context)
         return {'FINISHED'}
 
@@ -756,6 +957,20 @@ class MESH_PT_onion_skin(Panel):
         row.prop(props, "color_before", text="")
         row.prop(props, "color_after", text="")
 
+        # Performance settings (Scene/Collection modes only)
+        if props.mode != 'ACTIVE':
+            box = layout.box()
+            box.label(text="Performance")
+            box.prop(props, "bake_batch_size")
+
+        # Bake progress indicator
+        if _bake_timer_running:
+            box = layout.box()
+            box.label(
+                text=f"Baking... {_bake_progress:.0%}",
+                icon='SORTTIME',
+            )
+
         # Action buttons
         row = layout.row(align=True)
         toggle_text = "Disable" if props.enabled else "Enable"
@@ -790,7 +1005,11 @@ def register():
 
 
 def unregister():
-    global _draw_handle, _rebuild_scheduled
+    global _draw_handle, _rebuild_scheduled, _bake_timer_running
+    # Cancel progressive bake timer
+    if _bake_timer_running:
+        _bake_queue.clear()
+        _bake_timer_running = False
     if _rebuild_scheduled:
         try:
             bpy.app.timers.unregister(_do_rebuild)

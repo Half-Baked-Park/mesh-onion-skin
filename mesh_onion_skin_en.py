@@ -957,7 +957,9 @@ class MESH_PT_onion_skin(Panel):
         props = context.scene.mesh_onion_skin
 
         # Enable/Disable button — always active regardless of enabled state
-        row = layout.row(align=True)
+        header = layout.column()
+        header.active = True
+        row = header.row(align=True)
         toggle_text = "Disable" if props.enabled else "Enable"
         toggle_icon = 'PAUSE' if props.enabled else 'PLAY'
         row.operator("mesh.onion_skin_toggle", text=toggle_text,
@@ -965,7 +967,9 @@ class MESH_PT_onion_skin(Panel):
         row.operator("mesh.onion_skin_update", text="", icon='FILE_REFRESH')
 
         # Grey out the rest when disabled
-        layout.active = props.enabled
+        col = layout.column()
+        col.active = props.enabled
+        layout = col
 
         # Mode selector
         layout.prop(props, "mode", text="")

@@ -957,7 +957,9 @@ class MESH_PT_onion_skin(Panel):
         props = context.scene.mesh_onion_skin
 
         # 활성화/비활성화 버튼 — enabled 상태와 무관하게 항상 활성
-        row = layout.row(align=True)
+        header = layout.column()
+        header.active = True
+        row = header.row(align=True)
         toggle_text = "비활성화" if props.enabled else "활성화"
         toggle_icon = 'PAUSE' if props.enabled else 'PLAY'
         row.operator("mesh.onion_skin_toggle", text=toggle_text,
@@ -965,7 +967,9 @@ class MESH_PT_onion_skin(Panel):
         row.operator("mesh.onion_skin_update", text="", icon='FILE_REFRESH')
 
         # 비활성화 시 나머지 UI 회색 처리
-        layout.active = props.enabled
+        col = layout.column()
+        col.active = props.enabled
+        layout = col
 
         # 모드 선택
         layout.prop(props, "mode", text="")

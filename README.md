@@ -24,9 +24,12 @@ The maximum object limit has been raised from **50 to 500**, with new performanc
 
 | Option | Description |
 |--------|-------------|
+| **Skip Same Pose** | Automatically hide ghosts that look identical to the current pose |
 | **Ghost Detail** | Reduce ghost triangle count for lighter rendering (slider, 5%–100%) |
 | **Bake Batch** | How many frames to bake per tick — higher = faster bake, more stutter |
 | **Off-Screen Skip** | Skip drawing ghosts for objects outside the camera view |
+
+Also, **Keyframes Only** mode now works in all modes (previously Active only).
 
 ## Features
 
@@ -85,6 +88,7 @@ The maximum object limit has been raised from **50 to 500**, with new performanc
 | **In Front** | None / Ghost (draw ghosts on top) / Mesh (draw mesh on top) |
 | **Wireframe** | Show ghosts as outlines instead of solid |
 | **Before / After Color** | Color for past and future ghosts |
+| **Skip Same Pose** | Hide ghosts identical to the current pose |
 | **Ghost Detail** | Reduce ghost triangle count for performance (Scene/Collection modes) |
 | **Bake Batch** | Frames to bake per timer tick (Scene/Collection modes) |
 | **Off-Screen Skip** | Skip ghosts for objects outside the camera view (Scene/Collection modes) |

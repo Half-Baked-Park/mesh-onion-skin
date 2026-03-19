@@ -47,6 +47,9 @@ _merged_before: gpu.types.GPUBatch | None = None
 _merged_after: gpu.types.GPUBatch | None = None
 _merged_dirty: bool = True
 
+# --- Same-pose detection (current frame snapshots) ---
+_current_frame_snapshots: dict[str, np.ndarray] = {}
+
 
 def _get_shader():
     return gpu.shader.from_builtin('SMOOTH_COLOR')
@@ -263,8 +266,7 @@ def _get_target_frames(scene, props, obj) -> list[int]:
     current = scene.frame_current
     frames: list[int] = []
 
-    # Keyframe mode only works in Active mode
-    if props.use_keyframes and props.mode == 'ACTIVE':
+    if props.use_keyframes:
         _status, keyframes = _get_armature_keyframes(obj)
         before = [f for f in keyframes if f < current]
         after  = [f for f in keyframes if f > current]
@@ -394,6 +396,22 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
     # Cancel any in-progress bake
     _bake_generation += 1
 
+    # Capture current-frame snapshots for same-pose detection (once per rebuild)
+    _current_frame_snapshots.clear()
+    if props.skip_same_pose:
+        depsgraph_cur = bpy.context.evaluated_depsgraph_get()
+        all_obj_names = {n for names in frames_to_objects.values() for n in names}
+        for obj_name in all_obj_names:
+            obj = bpy.data.objects.get(obj_name)
+            if obj is None:
+                continue
+            try:
+                geo = _bake_mesh_snapshot(obj, depsgraph_cur, props.use_flat, props.ghost_detail)
+                if geo is not None:
+                    _current_frame_snapshots[obj_name] = geo[0]
+            except Exception:
+                pass
+
     # Build priority queue — closest frames first
     _bake_queue.clear()
     _bake_queue.extend(_build_prioritized_queue(scene.frame_current, frames_to_objects))
@@ -461,9 +479,16 @@ def _progressive_bake_tick(generation: int) -> float | None:
                     geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat, props.ghost_detail)
                 except Exception:
                     continue
-                if geo is not None:
-                    _onion_cache.setdefault(obj.name, {})[frame] = geo
-                    _merged_dirty = True
+                if geo is None:
+                    continue
+                # Skip ghost if pose is identical to current frame
+                if props.skip_same_pose:
+                    cur_snap = _current_frame_snapshots.get(obj_name)
+                    if cur_snap is not None and cur_snap.shape == geo[0].shape:
+                        if np.allclose(cur_snap, geo[0], atol=1e-4):
+                            continue
+                _onion_cache.setdefault(obj.name, {})[frame] = geo
+                _merged_dirty = True
             frames_done += 1
     finally:
         # Restore current frame to prevent viewport flicker
@@ -912,6 +937,11 @@ class MeshOnionSkinProps(PropertyGroup):
         description="Reduce ghost triangle count for better performance (lower = fewer triangles)",
         update=_update_cache_full,
     )
+    skip_same_pose: BoolProperty(
+        name="Skip Same Pose", default=True,
+        description="Hide ghosts that are identical to the current pose",
+        update=_update_cache_full,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1000,23 +1030,19 @@ class MESH_PT_onion_skin(Panel):
         row.prop(props, "count_before")
         row.prop(props, "count_after")
 
-        if props.mode == 'ACTIVE':
-            # Keyframes: only shown in Active mode
-            box.prop(props, "use_keyframes")
-            sub = box.row()
-            sub.active = not props.use_keyframes
-            sub.prop(props, "frame_step")
-            if props.use_keyframes:
-                obj = _get_target_mesh(context)
-                if obj:
-                    status, _kfs = _get_armature_keyframes(obj)
-                    has_kfs = len(_kfs) > 0
-                    box.label(
-                        text=f"  {status}",
-                        icon='ARMATURE_DATA' if has_kfs else 'ERROR',
-                    )
-        else:
-            box.prop(props, "frame_step")
+        box.prop(props, "use_keyframes")
+        sub = box.row()
+        sub.active = not props.use_keyframes
+        sub.prop(props, "frame_step")
+        if props.use_keyframes and props.mode == 'ACTIVE':
+            obj = _get_target_mesh(context)
+            if obj:
+                status, _kfs = _get_armature_keyframes(obj)
+                has_kfs = len(_kfs) > 0
+                box.label(
+                    text=f"  {status}",
+                    icon='ARMATURE_DATA' if has_kfs else 'ERROR',
+                )
 
         # Display settings
         box = layout.box()
@@ -1036,10 +1062,11 @@ class MESH_PT_onion_skin(Panel):
         row.prop(props, "color_before", text="")
         row.prop(props, "color_after", text="")
 
-        # Performance settings (Scene/Collection modes only)
+        # Performance settings
+        box = layout.box()
+        box.label(text="Performance")
+        box.prop(props, "skip_same_pose")
         if props.mode != 'ACTIVE':
-            box = layout.box()
-            box.label(text="Performance")
             box.prop(props, "ghost_detail", slider=True)
             box.prop(props, "bake_batch_size")
             box.prop(props, "use_frustum_cull")

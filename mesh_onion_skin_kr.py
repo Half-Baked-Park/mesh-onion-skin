@@ -47,6 +47,9 @@ _merged_before: gpu.types.GPUBatch | None = None
 _merged_after: gpu.types.GPUBatch | None = None
 _merged_dirty: bool = True
 
+# --- 동일 포즈 감지 (현재 프레임 스냅샷) ---
+_current_frame_snapshots: dict[str, np.ndarray] = {}
+
 
 def _get_shader():
     return gpu.shader.from_builtin('SMOOTH_COLOR')
@@ -263,8 +266,7 @@ def _get_target_frames(scene, props, obj) -> list[int]:
     current = scene.frame_current
     frames: list[int] = []
 
-    # 키프레임 모드는 Active 모드에서만 동작
-    if props.use_keyframes and props.mode == 'ACTIVE':
+    if props.use_keyframes:
         _status, keyframes = _get_armature_keyframes(obj)
         before = [f for f in keyframes if f < current]
         after  = [f for f in keyframes if f > current]
@@ -394,6 +396,22 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
     # 진행 중인 베이킹 취소
     _bake_generation += 1
 
+    # 동일 포즈 감지를 위해 현재 프레임 스냅샷 캡처 (리빌드당 1회)
+    _current_frame_snapshots.clear()
+    if props.skip_same_pose:
+        depsgraph_cur = bpy.context.evaluated_depsgraph_get()
+        all_obj_names = {n for names in frames_to_objects.values() for n in names}
+        for obj_name in all_obj_names:
+            obj = bpy.data.objects.get(obj_name)
+            if obj is None:
+                continue
+            try:
+                geo = _bake_mesh_snapshot(obj, depsgraph_cur, props.use_flat, props.ghost_detail)
+                if geo is not None:
+                    _current_frame_snapshots[obj_name] = geo[0]
+            except Exception:
+                pass
+
     # 우선순위 큐 구성 — 가까운 프레임부터
     _bake_queue.clear()
     _bake_queue.extend(_build_prioritized_queue(scene.frame_current, frames_to_objects))
@@ -461,9 +479,16 @@ def _progressive_bake_tick(generation: int) -> float | None:
                     geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat, props.ghost_detail)
                 except Exception:
                     continue
-                if geo is not None:
-                    _onion_cache.setdefault(obj.name, {})[frame] = geo
-                    _merged_dirty = True
+                if geo is None:
+                    continue
+                # 현재 프레임과 동일한 포즈면 스킵
+                if props.skip_same_pose:
+                    cur_snap = _current_frame_snapshots.get(obj_name)
+                    if cur_snap is not None and cur_snap.shape == geo[0].shape:
+                        if np.allclose(cur_snap, geo[0], atol=1e-4):
+                            continue
+                _onion_cache.setdefault(obj.name, {})[frame] = geo
+                _merged_dirty = True
             frames_done += 1
     finally:
         # 뷰포트 깜빡임 방지를 위해 현재 프레임 복원
@@ -912,6 +937,11 @@ class MeshOnionSkinProps(PropertyGroup):
         description="고스트 삼각형 수 축소로 성능 향상 (낮을수록 삼각형 적음)",
         update=_update_cache_full,
     )
+    skip_same_pose: BoolProperty(
+        name="동일 포즈 스킵", default=True,
+        description="현재 포즈와 동일한 고스트 숨기기",
+        update=_update_cache_full,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1000,23 +1030,19 @@ class MESH_PT_onion_skin(Panel):
         row.prop(props, "count_before")
         row.prop(props, "count_after")
 
-        if props.mode == 'ACTIVE':
-            # 키프레임: Active 모드에서만 표시
-            box.prop(props, "use_keyframes")
-            sub = box.row()
-            sub.active = not props.use_keyframes
-            sub.prop(props, "frame_step")
-            if props.use_keyframes:
-                obj = _get_target_mesh(context)
-                if obj:
-                    status, _kfs = _get_armature_keyframes(obj)
-                    has_kfs = len(_kfs) > 0
-                    box.label(
-                        text=f"  {status}",
-                        icon='ARMATURE_DATA' if has_kfs else 'ERROR',
-                    )
-        else:
-            box.prop(props, "frame_step")
+        box.prop(props, "use_keyframes")
+        sub = box.row()
+        sub.active = not props.use_keyframes
+        sub.prop(props, "frame_step")
+        if props.use_keyframes and props.mode == 'ACTIVE':
+            obj = _get_target_mesh(context)
+            if obj:
+                status, _kfs = _get_armature_keyframes(obj)
+                has_kfs = len(_kfs) > 0
+                box.label(
+                    text=f"  {status}",
+                    icon='ARMATURE_DATA' if has_kfs else 'ERROR',
+                )
 
         # 표시 설정
         box = layout.box()
@@ -1036,10 +1062,11 @@ class MESH_PT_onion_skin(Panel):
         row.prop(props, "color_before", text="")
         row.prop(props, "color_after", text="")
 
-        # 성능 설정 (Scene/Collection 모드에서만)
+        # 성능 설정
+        box = layout.box()
+        box.label(text="성능")
+        box.prop(props, "skip_same_pose")
         if props.mode != 'ACTIVE':
-            box = layout.box()
-            box.label(text="성능")
             box.prop(props, "ghost_detail", slider=True)
             box.prop(props, "bake_batch_size")
             box.prop(props, "use_frustum_cull")

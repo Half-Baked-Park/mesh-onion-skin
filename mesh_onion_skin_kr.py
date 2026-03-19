@@ -290,7 +290,7 @@ def _get_target_frames(scene, props, obj) -> list[int]:
 # 베이킹
 # ---------------------------------------------------------------------------
 
-def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
+def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool, ghost_detail: float = 1.0):
     """메시 스냅샷의 (positions, indices) numpy 배열 반환."""
     eval_obj = obj.evaluated_get(depsgraph)
     mesh = eval_obj.to_mesh()
@@ -329,6 +329,13 @@ def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
         idx = idx.reshape(-1, 3)
 
     eval_obj.to_mesh_clear()
+
+    # Ghost Detail — 균일 샘플링으로 삼각형/엣지 수 축소
+    if ghost_detail < 1.0 and len(idx) > 1:
+        keep = max(1, int(len(idx) * ghost_detail))
+        step = max(1, len(idx) // keep)
+        idx = idx[::step][:keep]
+
     return (co, idx)
 
 
@@ -455,7 +462,8 @@ def _progressive_bake_tick(generation: int) -> float | None:
                 if obj is None:
                     continue
                 try:
-                    geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat)
+                    detail = getattr(props, 'ghost_detail', 1.0)
+                    geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat, detail)
                 except Exception:
                     continue
                 if geo is not None:
@@ -915,9 +923,15 @@ class MeshOnionSkinProps(PropertyGroup):
         description="타이머 틱당 베이킹할 프레임 수 (높을수록 빠르지만 버벅임 증가)",
     )
     use_frustum_cull: BoolProperty(
-        name="프러스텀 컬링", default=True,
+        name="화면 밖 스킵", default=True,
         description="카메라 밖 오브젝트의 고스트 드로우 스킵",
         update=_update_display,
+    )
+    ghost_detail: FloatProperty(
+        name="고스트 디테일", default=1.0, min=0.05, max=1.0,
+        subtype='FACTOR',
+        description="고스트 삼각형 수 축소로 성능 향상 (낮을수록 삼각형 적음)",
+        update=_update_cache_full,
     )
 
 
@@ -1037,6 +1051,7 @@ class MESH_PT_onion_skin(Panel):
         if props.mode != 'ACTIVE':
             box = layout.box()
             box.label(text="성능")
+            box.prop(props, "ghost_detail", slider=True)
             box.prop(props, "bake_batch_size")
             box.prop(props, "use_frustum_cull")
 

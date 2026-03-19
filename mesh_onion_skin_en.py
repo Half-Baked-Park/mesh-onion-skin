@@ -290,7 +290,7 @@ def _get_target_frames(scene, props, obj) -> list[int]:
 # Baking
 # ---------------------------------------------------------------------------
 
-def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
+def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool, ghost_detail: float = 1.0):
     """Return (positions, indices) numpy arrays for the mesh snapshot."""
     eval_obj = obj.evaluated_get(depsgraph)
     mesh = eval_obj.to_mesh()
@@ -329,6 +329,13 @@ def _bake_mesh_snapshot(obj, depsgraph, use_flat: bool):
         idx = idx.reshape(-1, 3)
 
     eval_obj.to_mesh_clear()
+
+    # Ghost Detail — reduce triangle/edge count by uniform sampling
+    if ghost_detail < 1.0 and len(idx) > 1:
+        keep = max(1, int(len(idx) * ghost_detail))
+        step = max(1, len(idx) // keep)
+        idx = idx[::step][:keep]
+
     return (co, idx)
 
 
@@ -455,7 +462,8 @@ def _progressive_bake_tick(generation: int) -> float | None:
                 if obj is None:
                     continue
                 try:
-                    geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat)
+                    detail = getattr(props, 'ghost_detail', 1.0)
+                    geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat, detail)
                 except Exception:
                     continue
                 if geo is not None:
@@ -915,9 +923,15 @@ class MeshOnionSkinProps(PropertyGroup):
         description="Frames to bake per timer tick (higher = faster bake, more stutter)",
     )
     use_frustum_cull: BoolProperty(
-        name="Frustum Cull", default=True,
+        name="Off-Screen Skip", default=True,
         description="Skip drawing ghosts for objects outside the camera view",
         update=_update_display,
+    )
+    ghost_detail: FloatProperty(
+        name="Ghost Detail", default=1.0, min=0.05, max=1.0,
+        subtype='FACTOR',
+        description="Reduce ghost triangle count for better performance (lower = fewer triangles)",
+        update=_update_cache_full,
     )
 
 
@@ -1037,6 +1051,7 @@ class MESH_PT_onion_skin(Panel):
         if props.mode != 'ACTIVE':
             box = layout.box()
             box.label(text="Performance")
+            box.prop(props, "ghost_detail", slider=True)
             box.prop(props, "bake_batch_size")
             box.prop(props, "use_frustum_cull")
 

@@ -174,9 +174,159 @@ Phase 2 (GPU 드로우)
   └─ 2-4. .tolist() 제거
 
 Phase 3 (컬링 + LOD)
-  ├─ 3-1. 프러스텀 컬링
+  ├─ 3-1. 프러스텀 컬링 ✅
   ├─ 3-2. 모션 컬링
   ├─ 3-3. 거리 LOD
   ├─ 3-4. bbox 폴백
   └─ 3-5. 메모리 캡
+
+Phase 4 (하이폴리/모디파이어 최적화) — 미구현
+  ├─ 4-1. Decimation 프록시
+  ├─ 4-2. to_mesh 캐싱
+  ├─ 4-3. 모디파이어 스킵
+  └─ 4-4. 적응형 고스트 수
+```
+
+---
+
+## Phase 4 — 하이폴리 / 모디파이어 / 지오메트리노드 최적화
+
+> Phase 1-3은 "오브젝트 수가 많은" 시나리오 최적화.
+> Phase 4는 "오브젝트 수는 적지만 개별 오브젝트가 무거운" 시나리오 최적화.
+> 병목: `eval_obj.to_mesh()` — 모디파이어 스택/GeoNode 전체를 재평가하므로 오브젝트 1개에 수백ms 소요 가능.
+
+### 4-1. Decimation 프록시 베이킹
+
+**문제**: 500K vertex 메시의 고스트 6개 = 3M vertex → VRAM 폭발 + 느린 to_mesh
+
+**해결**: 고스트용 간소화 메시 생성
+- 베이킹 시 임시 Decimate 모디파이어 추가 (ratio=0.1~0.3)
+- 또는 bmesh.ops.dissolve_degenerate 사용
+- `ghost_lod_ratio` 프로퍼티로 조절 (default 0.2 = 원본의 20%)
+
+**적용 시점**: `_bake_mesh_snapshot` 내부
+```
+# 의사코드
+if props.use_ghost_lod and vertex_count > props.lod_vertex_threshold:
+    # 임시 Decimate 모디파이어 추가
+    mod = obj.modifiers.new("_onion_decimate", 'DECIMATE')
+    mod.ratio = props.ghost_lod_ratio
+    # evaluated mesh 재취득
+    depsgraph.update()
+    eval_obj = obj.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
+    # 베이킹 후 모디파이어 제거
+    obj.modifiers.remove(mod)
+```
+
+**리스크**:
+- Decimate 모디파이어 추가/제거가 depsgraph를 오염시킬 수 있음
+- 해결: evaluated copy에서 작업하거나, 별도 빈 오브젝트에 데이터를 복사해서 decimation
+
+**예상 효과**: 500K → 100K vertex per ghost. VRAM 80% 감소, to_mesh 자체는 여전히 비쌈
+
+### 4-2. to_mesh 결과 캐싱 (Cross-frame 재활용)
+
+**문제**: 매 고스트 프레임마다 `to_mesh()` 호출 = 모디파이어 전체 재평가
+
+**해결**: 이전 프레임 대비 변화량 체크 → 변화 없으면 이전 결과 재활용
+- `frame_set` 후 `obj.matrix_world` + 주요 본 위치 비교
+- 변화 미미하면 기존 캐시 엔트리 복사 (to_mesh 스킵)
+
+**데이터 구조**:
+```
+_motion_hash: dict[str, dict[int, tuple[float, ...]]] = {}
+# obj_name -> {frame -> (tx, ty, tz, bone0_x, bone0_y, ...)}
+```
+
+**적용 시점**: `_progressive_bake_tick` 내, `_bake_mesh_snapshot` 호출 전
+```
+# 의사코드
+current_hash = _compute_motion_hash(obj, scene)
+prev_frame_hash = _motion_hash.get(obj.name, {}).get(prev_frame)
+if prev_frame_hash and _hash_distance(current_hash, prev_frame_hash) < threshold:
+    # 이전 프레임 캐시 재활용
+    _onion_cache[obj.name][frame] = _onion_cache[obj.name][prev_frame]
+    continue  # to_mesh 호출 스킵
+```
+
+**리스크**:
+- 본 위치만 비교하면 셰이프키/cloth/soft body 변형 감지 못함
+- 해시 계산 자체가 frame_set 후에만 가능 (to_mesh 대비 비용은 미미)
+
+**예상 효과**: 정지 구간에서 to_mesh 호출 90%+ 감소
+
+### 4-3. 모디파이어 선택적 비활성화
+
+**문제**: Subdivision Surface, Smooth, Bevel 등 형상에 영향 적은 모디파이어도 고스트 베이킹 시 재평가됨
+
+**해결**: 고스트 베이킹 시 불필요 모디파이어 임시 비활성화
+- `SUBSURF`, `SMOOTH`, `BEVEL`, `SOLIDIFY` 등 → show_viewport 임시 off
+- `ARMATURE`, `MESH_DEFORM` 등 변형 모디파이어는 유지
+- `ghost_skip_modifiers` 프로퍼티: 스킵할 모디파이어 타입 리스트
+
+**적용 시점**: `_bake_mesh_snapshot` 전후
+```
+# 의사코드
+SKIPPABLE = {'SUBSURF', 'SMOOTH', 'BEVEL', 'SOLIDIFY', 'WEIGHTED_NORMAL'}
+disabled = []
+for mod in obj.modifiers:
+    if mod.type in SKIPPABLE and mod.show_viewport:
+        mod.show_viewport = False
+        disabled.append(mod)
+# ... bake ...
+for mod in disabled:
+    mod.show_viewport = True
+```
+
+**리스크**:
+- 모디파이어 비활성화가 최종 형상을 변형 → 고스트가 원본과 다르게 보일 수 있음
+- 사용자 선택에 맡기기 (opt-in)
+- depsgraph 오염: show_viewport 변경이 다른 오브젝트에 영향 줄 수 있음
+
+**예상 효과**: Subdivision Level 2 기준 vertex 4x 감소 → to_mesh 4x 빨라짐
+
+### 4-4. 적응형 고스트 수
+
+**문제**: 하이폴리 오브젝트에 before 3 + after 3 = 6 고스트 → to_mesh 6회
+
+**해결**: vertex 수 기반 자동 고스트 수 조절
+- `auto_ghost_count` 모드: vertex > 100K → before/after 각 1개, > 50K → 각 2개
+- 또는 총 고스트 vertex 예산 (budget) 기반
+- `ghost_vertex_budget` 프로퍼티 (default 1M vertices)
+
+**적용 시점**: `_get_target_frames` 내
+```
+# 의사코드
+if props.auto_ghost_count:
+    vertex_count = len(obj.data.vertices)  # base mesh vertex count
+    if vertex_count > 100_000:
+        effective_before = min(1, props.count_before)
+        effective_after = min(1, props.count_after)
+    elif vertex_count > 50_000:
+        effective_before = min(2, props.count_before)
+        effective_after = min(2, props.count_after)
+```
+
+**리스크**: 없음 (단순한 조건부 축소)
+
+**예상 효과**: 하이폴리 오브젝트의 to_mesh 호출 50-70% 감소
+
+### Phase 4 구현 우선순위
+
+| 순위 | 항목 | 복잡도 | 효과 | 리스크 |
+|------|------|--------|------|--------|
+| 1 | 4-4. 적응형 고스트 수 | 낮음 | 중간 | 없음 |
+| 2 | 4-2. to_mesh 캐싱 | 중간 | 높음 | 변형 미감지 가능 |
+| 3 | 4-3. 모디파이어 스킵 | 중간 | 높음 | 형상 차이 |
+| 4 | 4-1. Decimation 프록시 | 높음 | 매우높음 | depsgraph 오염 |
+
+### Phase 4 새 프로퍼티
+
+```
+auto_ghost_count: BoolProperty (default False)
+ghost_vertex_budget: IntProperty (default 1_000_000)
+ghost_lod_ratio: FloatProperty (default 0.2, min 0.01, max 1.0)
+lod_vertex_threshold: IntProperty (default 50_000)
+skip_heavy_modifiers: BoolProperty (default False)
 ```

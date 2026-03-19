@@ -54,6 +54,59 @@ def _get_shader():
 
 
 # ---------------------------------------------------------------------------
+# Frustum culling (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _get_active_3d_view():
+    """Return (region, region_3d) for the active 3D viewport, or (None, None)."""
+    try:
+        for area in bpy.context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for region in area.regions:
+                    if region.type == 'WINDOW':
+                        return region, area.spaces.active.region_3d
+    except Exception:
+        pass
+    return None, None
+
+
+def _extract_frustum_planes(perspective_matrix) -> np.ndarray:
+    """Extract 6 frustum planes from VP matrix (Gribb-Hartmann method). Returns (6, 4) array."""
+    m = np.array(perspective_matrix, dtype=np.float32)
+    planes = np.empty((6, 4), dtype=np.float32)
+    planes[0] = m[3] + m[0]   # Left
+    planes[1] = m[3] - m[0]   # Right
+    planes[2] = m[3] + m[1]   # Bottom
+    planes[3] = m[3] - m[1]   # Top
+    planes[4] = m[3] + m[2]   # Near
+    planes[5] = m[3] - m[2]   # Far
+    # Normalize
+    norms = np.linalg.norm(planes[:, :3], axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    planes /= norms
+    return planes
+
+
+def _is_in_frustum(obj, frustum_planes: np.ndarray) -> bool:
+    """Test if object's bounding box intersects the view frustum."""
+    bb = obj.bound_box  # 8 corners in local space
+    mat = np.array(obj.matrix_world, dtype=np.float32)
+    corners_h = np.empty((8, 4), dtype=np.float32)
+    for i, c in enumerate(bb):
+        corners_h[i, 0] = c[0]
+        corners_h[i, 1] = c[1]
+        corners_h[i, 2] = c[2]
+    corners_h[:, 3] = 1.0
+    world = (corners_h @ mat.T)[:, :3]  # (8, 3)
+    # If all 8 corners are outside any single plane → outside frustum
+    for i in range(6):
+        dots = world @ frustum_planes[i, :3] + frustum_planes[i, 3]
+        if np.all(dots < 0):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Target collection
 # ---------------------------------------------------------------------------
 
@@ -475,9 +528,25 @@ def _build_merged_batches():
     before_offset = 0
     after_offset = 0
 
+    # Frustum culling — skip objects outside viewport
+    frustum_planes = None
+    if getattr(props, 'use_frustum_cull', True) and props.mode != 'ACTIVE':
+        _region, rv3d = _get_active_3d_view()
+        if rv3d:
+            try:
+                frustum_planes = _extract_frustum_planes(rv3d.perspective_matrix)
+            except Exception:
+                pass
+
     for obj_name, cache in _onion_cache.items():
         if not cache:
             continue
+
+        # Frustum cull — skip objects outside camera view
+        if frustum_planes is not None:
+            obj = bpy.data.objects.get(obj_name)
+            if obj and not _is_in_frustum(obj, frustum_planes):
+                continue
 
         before_frames = sorted([f for f in cache if f < current], reverse=True)
         after_frames = sorted([f for f in cache if f > current])
@@ -843,6 +912,11 @@ class MeshOnionSkinProps(PropertyGroup):
         name="Bake Batch", default=2, min=1, max=10,
         description="Frames to bake per timer tick (higher = faster bake, more stutter)",
     )
+    use_frustum_cull: BoolProperty(
+        name="Frustum Cull", default=True,
+        description="Skip drawing ghosts for objects outside the camera view",
+        update=_update_display,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +1036,7 @@ class MESH_PT_onion_skin(Panel):
             box = layout.box()
             box.label(text="Performance")
             box.prop(props, "bake_batch_size")
+            box.prop(props, "use_frustum_cull")
 
         # Bake progress indicator
         if _bake_timer_running:

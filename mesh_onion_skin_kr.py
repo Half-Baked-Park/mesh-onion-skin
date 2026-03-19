@@ -54,6 +54,59 @@ def _get_shader():
 
 
 # ---------------------------------------------------------------------------
+# 프러스텀 컬링 (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _get_active_3d_view():
+    """활성 3D 뷰포트의 (region, region_3d) 반환. 없으면 (None, None)."""
+    try:
+        for area in bpy.context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for region in area.regions:
+                    if region.type == 'WINDOW':
+                        return region, area.spaces.active.region_3d
+    except Exception:
+        pass
+    return None, None
+
+
+def _extract_frustum_planes(perspective_matrix) -> np.ndarray:
+    """VP 행렬에서 6개 프러스텀 평면 추출 (Gribb-Hartmann). (6, 4) 배열 반환."""
+    m = np.array(perspective_matrix, dtype=np.float32)
+    planes = np.empty((6, 4), dtype=np.float32)
+    planes[0] = m[3] + m[0]   # Left
+    planes[1] = m[3] - m[0]   # Right
+    planes[2] = m[3] + m[1]   # Bottom
+    planes[3] = m[3] - m[1]   # Top
+    planes[4] = m[3] + m[2]   # Near
+    planes[5] = m[3] - m[2]   # Far
+    # 정규화
+    norms = np.linalg.norm(planes[:, :3], axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    planes /= norms
+    return planes
+
+
+def _is_in_frustum(obj, frustum_planes: np.ndarray) -> bool:
+    """오브젝트의 바운딩 박스가 뷰 프러스텀과 교차하는지 테스트."""
+    bb = obj.bound_box  # 로컬 좌표 8개 꼭짓점
+    mat = np.array(obj.matrix_world, dtype=np.float32)
+    corners_h = np.empty((8, 4), dtype=np.float32)
+    for i, c in enumerate(bb):
+        corners_h[i, 0] = c[0]
+        corners_h[i, 1] = c[1]
+        corners_h[i, 2] = c[2]
+    corners_h[:, 3] = 1.0
+    world = (corners_h @ mat.T)[:, :3]  # (8, 3)
+    # 8개 꼭짓점 모두 하나의 평면 바깥이면 → 프러스텀 밖
+    for i in range(6):
+        dots = world @ frustum_planes[i, :3] + frustum_planes[i, 3]
+        if np.all(dots < 0):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # 타겟 수집
 # ---------------------------------------------------------------------------
 
@@ -475,9 +528,25 @@ def _build_merged_batches():
     before_offset = 0
     after_offset = 0
 
+    # 프러스텀 컬링 — 뷰포트 밖 오브젝트 스킵
+    frustum_planes = None
+    if getattr(props, 'use_frustum_cull', True) and props.mode != 'ACTIVE':
+        _region, rv3d = _get_active_3d_view()
+        if rv3d:
+            try:
+                frustum_planes = _extract_frustum_planes(rv3d.perspective_matrix)
+            except Exception:
+                pass
+
     for obj_name, cache in _onion_cache.items():
         if not cache:
             continue
+
+        # 프러스텀 컬링 — 카메라 밖 오브젝트 스킵
+        if frustum_planes is not None:
+            obj = bpy.data.objects.get(obj_name)
+            if obj and not _is_in_frustum(obj, frustum_planes):
+                continue
 
         before_frames = sorted([f for f in cache if f < current], reverse=True)
         after_frames = sorted([f for f in cache if f > current])
@@ -843,6 +912,11 @@ class MeshOnionSkinProps(PropertyGroup):
         name="베이크 배치", default=2, min=1, max=10,
         description="타이머 틱당 베이킹할 프레임 수 (높을수록 빠르지만 버벅임 증가)",
     )
+    use_frustum_cull: BoolProperty(
+        name="프러스텀 컬링", default=True,
+        description="카메라 밖 오브젝트의 고스트 드로우 스킵",
+        update=_update_display,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +1036,7 @@ class MESH_PT_onion_skin(Panel):
             box = layout.box()
             box.label(text="성능")
             box.prop(props, "bake_batch_size")
+            box.prop(props, "use_frustum_cull")
 
         # 베이킹 진행률 표시
         if _bake_timer_running:

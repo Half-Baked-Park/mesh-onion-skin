@@ -11,7 +11,8 @@ bl_info = {
 import bpy
 import gpu
 import numpy as np
-import functools
+from functools import partial
+from collections import deque
 from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty, IntProperty, FloatProperty,
@@ -34,10 +35,8 @@ _pending_rebuild = None  # (scene,)
 # mesh_in_front 적용 전 원래 show_in_front 값 보존 {오브젝트명: bool}
 _original_mesh_show_in_front: dict[str, bool] = {}
 
-_PERF_WARN_THRESHOLD = 10
-
 # --- 점진적 베이킹 상태 ---
-_bake_queue: list[tuple[int, list]] = []  # (frame, [objects]) 우선순위 큐
+_bake_queue: deque[tuple[int, list]] = deque()  # (frame, [obj_names]) 우선순위 큐
 _bake_generation: int = 0  # 세대 카운터 — 스크러빙 시 stale 작업 취소
 _bake_timer_running: bool = False
 _bake_progress: float = 0.0  # 0.0~1.0 베이킹 진행률
@@ -92,10 +91,7 @@ def _is_in_frustum(obj, frustum_planes: np.ndarray) -> bool:
     bb = obj.bound_box  # 로컬 좌표 8개 꼭짓점
     mat = np.array(obj.matrix_world, dtype=np.float32)
     corners_h = np.empty((8, 4), dtype=np.float32)
-    for i, c in enumerate(bb):
-        corners_h[i, 0] = c[0]
-        corners_h[i, 1] = c[1]
-        corners_h[i, 2] = c[2]
+    corners_h[:, :3] = np.array(bb, dtype=np.float32)
     corners_h[:, 3] = 1.0
     world = (corners_h @ mat.T)[:, :3]  # (8, 3)
     # 8개 꼭짓점 모두 하나의 평면 바깥이면 → 프러스텀 밖
@@ -357,7 +353,7 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
         return
 
     if targets is None:
-        targets = _collect_target_meshes()
+        targets = _collect_target_meshes(scene=scene)
     if not targets:
         clear_cache()
         return
@@ -409,7 +405,7 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
     _bake_timer_running = True
     gen = _bake_generation
     bpy.app.timers.register(
-        functools.partial(_progressive_bake_tick, gen),
+        partial(_progressive_bake_tick, gen),
         first_interval=0.0,
     )
 
@@ -442,7 +438,7 @@ def _progressive_bake_tick(generation: int) -> float | None:
         return None
 
     # 배치 크기 결정 (틱당 프레임 수)
-    batch_size = max(1, getattr(props, 'bake_batch_size', 2))
+    batch_size = max(1, props.bake_batch_size)
     current = scene.frame_current
     _is_baking = True
 
@@ -454,7 +450,7 @@ def _progressive_bake_tick(generation: int) -> float | None:
                 _bake_timer_running = False
                 return None
 
-            frame, obj_names = _bake_queue.pop(0)
+            frame, obj_names = _bake_queue.popleft()
             scene.frame_set(frame)
             depsgraph = bpy.context.evaluated_depsgraph_get()
             for obj_name in obj_names:
@@ -462,8 +458,7 @@ def _progressive_bake_tick(generation: int) -> float | None:
                 if obj is None:
                     continue
                 try:
-                    detail = getattr(props, 'ghost_detail', 1.0)
-                    geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat, detail)
+                    geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat, props.ghost_detail)
                 except Exception:
                     continue
                 if geo is not None:
@@ -537,13 +532,51 @@ def _build_merged_batches():
 
     # 프러스텀 컬링 — 뷰포트 밖 오브젝트 스킵
     frustum_planes = None
-    if getattr(props, 'use_frustum_cull', True) and props.mode != 'ACTIVE':
+    if props.use_frustum_cull and props.mode != 'ACTIVE':
         _region, rv3d = _get_active_3d_view()
         if rv3d:
             try:
                 frustum_planes = _extract_frustum_planes(rv3d.perspective_matrix)
             except Exception:
                 pass
+
+    def _collect_ghost_parts(frames, cache, color_rgb, offset):
+        """고스트 프레임 목록에서 (pos, vertex_color, offset_idx) 튜플 수집."""
+        parts = []
+        n = len(frames)
+        for i, frame in enumerate(frames):
+            geo = cache.get(frame)
+            if geo is None:
+                continue
+            pos, idx = geo
+            n_verts = len(pos)
+            if props.use_fade:
+                t = (i + 1) / (n + 1)
+                alpha = props.opacity * ((1.0 - t) ** props.fade_falloff)
+            else:
+                alpha = props.opacity
+            vc = np.empty((n_verts, 4), dtype=np.float32)
+            vc[:, :3] = color_rgb
+            vc[:, 3] = alpha
+            parts.append((pos, vc, idx + offset))
+            offset += n_verts
+        return parts, offset
+
+    def _finalize_batch(parts):
+        """파트를 합치고 GPU 배치 생성. 없으면 None 반환."""
+        if not parts:
+            return None
+        m_pos = np.concatenate([p[0] for p in parts])
+        m_col = np.concatenate([p[1] for p in parts])
+        m_idx = np.concatenate([p[2] for p in parts])
+        return batch_for_shader(
+            _get_shader(), prim_type,
+            {"pos": m_pos, "color": m_col},
+            indices=m_idx.tolist(),
+        )
+
+    color_before = np.array(props.color_before[:3], dtype=np.float32)
+    color_after = np.array(props.color_after[:3], dtype=np.float32)
 
     for obj_name, cache in _onion_cache.items():
         if not cache:
@@ -558,69 +591,14 @@ def _build_merged_batches():
         before_frames = sorted([f for f in cache if f < current], reverse=True)
         after_frames = sorted([f for f in cache if f > current])
 
-        # Before 고스트
-        n_before = len(before_frames)
-        for i, frame in enumerate(before_frames):
-            geo = cache.get(frame)
-            if geo is None:
-                continue
-            pos, idx = geo
-            n_verts = len(pos)
-            if props.use_fade:
-                t = (i + 1) / (n_before + 1)
-                alpha = props.opacity * ((1.0 - t) ** props.fade_falloff)
-            else:
-                alpha = props.opacity
-            vc = np.empty((n_verts, 4), dtype=np.float32)
-            vc[:, 0] = props.color_before[0]
-            vc[:, 1] = props.color_before[1]
-            vc[:, 2] = props.color_before[2]
-            vc[:, 3] = alpha
-            before_parts.append((pos, vc, idx + before_offset))
-            before_offset += n_verts
+        parts, before_offset = _collect_ghost_parts(before_frames, cache, color_before, before_offset)
+        before_parts.extend(parts)
 
-        # After 고스트
-        n_after = len(after_frames)
-        for i, frame in enumerate(after_frames):
-            geo = cache.get(frame)
-            if geo is None:
-                continue
-            pos, idx = geo
-            n_verts = len(pos)
-            if props.use_fade:
-                t = (i + 1) / (n_after + 1)
-                alpha = props.opacity * ((1.0 - t) ** props.fade_falloff)
-            else:
-                alpha = props.opacity
-            vc = np.empty((n_verts, 4), dtype=np.float32)
-            vc[:, 0] = props.color_after[0]
-            vc[:, 1] = props.color_after[1]
-            vc[:, 2] = props.color_after[2]
-            vc[:, 3] = alpha
-            after_parts.append((pos, vc, idx + after_offset))
-            after_offset += n_verts
+        parts, after_offset = _collect_ghost_parts(after_frames, cache, color_after, after_offset)
+        after_parts.extend(parts)
 
-    shader = _get_shader()
-
-    if before_parts:
-        m_pos = np.concatenate([p[0] for p in before_parts])
-        m_col = np.concatenate([p[1] for p in before_parts])
-        m_idx = np.concatenate([p[2] for p in before_parts])
-        _merged_before = batch_for_shader(
-            shader, prim_type,
-            {"pos": m_pos, "color": m_col},
-            indices=m_idx.tolist(),
-        )
-
-    if after_parts:
-        m_pos = np.concatenate([p[0] for p in after_parts])
-        m_col = np.concatenate([p[1] for p in after_parts])
-        m_idx = np.concatenate([p[2] for p in after_parts])
-        _merged_after = batch_for_shader(
-            shader, prim_type,
-            {"pos": m_pos, "color": m_col},
-            indices=m_idx.tolist(),
-        )
+    _merged_before = _finalize_batch(before_parts)
+    _merged_after = _finalize_batch(after_parts)
 
 
 def draw_onion_skins():
@@ -736,13 +714,6 @@ def _schedule_rebuild(context=None, force_clear: bool = False):
 # 프로퍼티 업데이트 콜백
 # ---------------------------------------------------------------------------
 
-def _tag_redraw(context):
-    if context and context.screen:
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
-
-
 def _clear_fcurve_if_present(scene, data_path: str):
     """씬 액션에서 해당 경로의 fcurve를 제거한다. frame_set() 중 덮어쓰기 방지용."""
     ad = scene.animation_data
@@ -767,30 +738,38 @@ def _clear_fcurve_if_present(scene, data_path: str):
         pass
 
 
+_ONION_FCURVE_PATHS = (
+    'mesh_onion_skin.use_keyframes',
+    'mesh_onion_skin.use_flat',
+    'mesh_onion_skin.mode',
+)
+
+
+def _clear_onion_fcurves(context):
+    """frame_set() 중 프로퍼티 값 덮어쓰기 방지를 위해 어니언 스킨 fcurve 제거."""
+    scene = context.scene if context else bpy.context.scene
+    for path in _ONION_FCURVE_PATHS:
+        _clear_fcurve_if_present(scene, path)
+
+
 def _update_cache(self, context):
     """증분 리빌드 — 겹치는 캐시 프레임 재활용."""
-    scene = context.scene if context else bpy.context.scene
-    _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_keyframes')
-    _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_flat')
-    _clear_fcurve_if_present(scene, 'mesh_onion_skin.mode')
+    _clear_onion_fcurves(context)
     _schedule_rebuild(context)
-    _tag_redraw(context)
+    _request_viewport_redraw()
 
 
 def _update_cache_full(self, context):
     """전체 리빌드 — 포맷 변경 시 전체 캐시 클리어 (와이어프레임 토글 등)."""
-    scene = context.scene if context else bpy.context.scene
-    _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_keyframes')
-    _clear_fcurve_if_present(scene, 'mesh_onion_skin.use_flat')
-    _clear_fcurve_if_present(scene, 'mesh_onion_skin.mode')
+    _clear_onion_fcurves(context)
     _schedule_rebuild(context, force_clear=True)
-    _tag_redraw(context)
+    _request_viewport_redraw()
 
 
 def _update_mode(self, context):
     """모드 전환 시 – 전체 클리어 + 리빌드 (타겟 세트 완전 변경)."""
     _schedule_rebuild(context, force_clear=True)
-    _tag_redraw(context)
+    _request_viewport_redraw()
 
 
 def _update_enabled(self, context):
@@ -799,14 +778,14 @@ def _update_enabled(self, context):
         _schedule_rebuild(context, force_clear=True)
     else:
         clear_cache()
-    _tag_redraw(context)
+    _request_viewport_redraw()
 
 
 def _update_display(self, context):
     """드로우만 갱신하면 되는 설정 변경 시 (색상, 불투명도, 페이드)."""
     global _merged_dirty
     _merged_dirty = True  # 색상/불투명도가 per-vertex 데이터에 반영됨
-    _tag_redraw(context)
+    _request_viewport_redraw()
 
 
 def _update_in_front(self, context):
@@ -819,7 +798,7 @@ def _update_in_front(self, context):
             obj.show_in_front = True
         else:
             obj.show_in_front = _original_mesh_show_in_front.pop(obj.name, False)
-    _tag_redraw(context)
+    _request_viewport_redraw()
 
 
 # ---------------------------------------------------------------------------
@@ -958,7 +937,7 @@ class MESH_OT_onion_skin_update(Operator):
     def execute(self, context):
         targets = _collect_target_meshes(context=context)
         rebuild_cache(context.scene, targets, force_clear=True)
-        _tag_redraw(context)
+        _request_viewport_redraw()
         return {'FINISHED'}
 
 

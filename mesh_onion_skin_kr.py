@@ -125,15 +125,26 @@ def _get_target_mesh(context=None):
 
 
 def _has_animation(obj) -> bool:
-    """오브젝트에 애니메이션 데이터가 있는지 확인."""
-    if obj.animation_data and obj.animation_data.action:
-        return True
+    """오브젝트에 애니메이션 소스가 있는지 확인 (액션, 드라이버, NLA, 제약조건, 애니메이션된 부모 포함)."""
+    ad = obj.animation_data
+    if ad:
+        if ad.action:
+            return True
+        if ad.drivers:
+            return True
+        if ad.nla_tracks:
+            return True
     arm = _find_armature(obj)
     if arm and _get_active_action(arm):
         return True
     if obj.data and hasattr(obj.data, 'shape_keys') and obj.data.shape_keys:
         if obj.data.shape_keys.animation_data:
             return True
+    if obj.constraints:
+        return True
+    # 애니메이션된 부모의 자식 (예: 애니메이션된 Empty/Armature에 페어런트)
+    if obj.parent and obj.parent.type != 'ARMATURE':
+        return True
     return False
 
 

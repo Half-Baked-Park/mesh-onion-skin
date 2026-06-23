@@ -28,6 +28,8 @@ from gpu_extras.batch import batch_for_shader
 
 # {object_name: {frame_number: (positions, indices)}}
 _onion_cache: dict[str, dict[int, tuple[np.ndarray, np.ndarray]]] = {}
+# {armature_name: (action_name, sorted_keyframe_frames)} — avoids re-walking keyframes every frame
+_keyframe_cache: dict[str, tuple[str, list[int]]] = {}
 _draw_handle = None
 _is_baking = False
 _rebuild_scheduled = False
@@ -200,6 +202,7 @@ def clear_cache(obj_name: str | None = None):
         _onion_cache.pop(obj_name, None)
     else:
         _onion_cache.clear()
+        _keyframe_cache.clear()
     _merged_before = None
     _merged_after = None
     _merged_dirty = True
@@ -234,6 +237,17 @@ def _get_active_action(arm):
     return None
 
 
+def _fcurve_key_frames(fc, kf_set: set[int]) -> None:
+    """Bulk-read one fcurve's keyframe frame numbers into kf_set (C-speed foreach_get)."""
+    n = len(fc.keyframe_points)
+    if n == 0:
+        return
+    co = np.empty(n * 2, dtype=np.float32)
+    fc.keyframe_points.foreach_get("co", co)
+    # co = [frame0, value0, frame1, value1, ...] → take frame components, round to int
+    kf_set.update(np.rint(co[0::2]).astype(np.int64).tolist())
+
+
 def _collect_keyframes_from_action(action) -> set[int]:
     """Collect keyframe numbers from action (Blender 5.0 Layered Action + legacy fallback)."""
     kf_set: set[int] = set()
@@ -243,16 +257,14 @@ def _collect_keyframes_from_action(action) -> set[int]:
             for strip in layer.strips:
                 for bag in strip.channelbags:
                     for fc in bag.fcurves:
-                        for kp in fc.keyframe_points:
-                            kf_set.add(round(kp.co[0]))
+                        _fcurve_key_frames(fc, kf_set)
     except (AttributeError, TypeError):
         pass
     # Legacy fallback: direct action.fcurves access
     if not kf_set:
         try:
             for fc in action.fcurves:
-                for kp in fc.keyframe_points:
-                    kf_set.add(round(kp.co[0]))
+                _fcurve_key_frames(fc, kf_set)
         except (AttributeError, RuntimeError):
             pass
     return kf_set
@@ -266,9 +278,16 @@ def _get_armature_keyframes(obj) -> tuple[str, list[int]]:
     action = _get_active_action(arm)
     if action is None:
         return f"{arm.name}: No active action", []
-    kf_set = _collect_keyframes_from_action(action)
-    if kf_set:
-        return f"{arm.name} > {action.name}: {len(kf_set)} keys", sorted(kf_set)
+    # Cache per armature — re-collect only when the action changes or the cache is cleared.
+    # (After editing keyframes in the same action, press the Update button to refresh.)
+    cached = _keyframe_cache.get(arm.name)
+    if cached is not None and cached[0] == action.name:
+        frames = cached[1]
+    else:
+        frames = sorted(_collect_keyframes_from_action(action))
+        _keyframe_cache[arm.name] = (action.name, frames)
+    if frames:
+        return f"{arm.name} > {action.name}: {len(frames)} keys", frames
     return f"{arm.name} > {action.name}: 0 keys", []
 
 
@@ -355,6 +374,52 @@ def _build_prioritized_queue(current_frame: int, frames_to_objects: dict[int, li
     return items
 
 
+def _bake_queue_item(scene, props, frame, obj_names) -> None:
+    """Bake one (frame, obj_names) queue entry into the cache. Shared by sync + progressive paths.
+
+    Caller is responsible for setting _is_baking and restoring the current frame.
+    """
+    global _merged_dirty
+    scene.frame_set(frame)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    for obj_name in obj_names:
+        obj = bpy.data.objects.get(obj_name)
+        if obj is None:
+            continue
+        try:
+            geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat, props.ghost_detail)
+        except Exception:
+            continue
+        if geo is None:
+            continue
+        # Skip ghost if pose is identical to current frame
+        if props.skip_same_pose:
+            cur_snap = _current_frame_snapshots.get(obj_name)
+            if cur_snap is not None and cur_snap.shape == geo[0].shape:
+                if np.allclose(cur_snap, geo[0], atol=1e-4):
+                    continue
+        _onion_cache.setdefault(obj.name, {})[frame] = geo
+        _merged_dirty = True
+
+
+def _bake_all_sync(scene, props) -> None:
+    """Bake the whole queue immediately (blocking). Used when sync_bake (live follow) is on."""
+    global _is_baking
+    current = scene.frame_current
+    _is_baking = True
+    try:
+        while _bake_queue:
+            frame, obj_names = _bake_queue.popleft()
+            _bake_queue_item(scene, props, frame, obj_names)
+    finally:
+        # Restore current frame to prevent viewport flicker
+        try:
+            scene.frame_set(current)
+        except Exception:
+            pass
+        _is_baking = False
+
+
 def rebuild_cache(scene, targets=None, force_clear: bool = False):
     """Compute delta and enqueue progressive baking. Non-blocking."""
     global _bake_generation, _bake_timer_running, _bake_progress, _bake_total_frames, _merged_dirty
@@ -429,6 +494,14 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
     _bake_total_frames = len(_bake_queue)
     _bake_progress = 0.0
 
+    # Sync (live-follow) bake — bake everything now so ghosts follow during scrub/playback
+    if props.sync_bake:
+        _bake_all_sync(scene, props)
+        _bake_timer_running = False
+        _bake_progress = 1.0
+        _merged_dirty = True
+        return
+
     # Start progressive bake timer
     # Always register a new timer — old one will self-abort on generation mismatch
     _bake_timer_running = True
@@ -441,7 +514,7 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
 
 def _progressive_bake_tick(generation: int) -> float | None:
     """Timer callback — bakes N frames per tick, yields back to Blender."""
-    global _is_baking, _bake_timer_running, _bake_progress, _merged_dirty
+    global _is_baking, _bake_timer_running, _bake_progress
 
     # Stale generation — abort
     if generation != _bake_generation:
@@ -480,26 +553,7 @@ def _progressive_bake_tick(generation: int) -> float | None:
                 return None
 
             frame, obj_names = _bake_queue.popleft()
-            scene.frame_set(frame)
-            depsgraph = bpy.context.evaluated_depsgraph_get()
-            for obj_name in obj_names:
-                obj = bpy.data.objects.get(obj_name)
-                if obj is None:
-                    continue
-                try:
-                    geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat, props.ghost_detail)
-                except Exception:
-                    continue
-                if geo is None:
-                    continue
-                # Skip ghost if pose is identical to current frame
-                if props.skip_same_pose:
-                    cur_snap = _current_frame_snapshots.get(obj_name)
-                    if cur_snap is not None and cur_snap.shape == geo[0].shape:
-                        if np.allclose(cur_snap, geo[0], atol=1e-4):
-                            continue
-                _onion_cache.setdefault(obj.name, {})[frame] = geo
-                _merged_dirty = True
+            _bake_queue_item(scene, props, frame, obj_names)
             frames_done += 1
     finally:
         # Restore current frame to prevent viewport flicker
@@ -953,6 +1007,11 @@ class MeshOnionSkinProps(PropertyGroup):
         description="Hide ghosts that are identical to the current pose",
         update=_update_cache_full,
     )
+    sync_bake: BoolProperty(
+        name="Sync Bake (Live Follow)", default=False,
+        description="Bake synchronously so ghosts follow during scrub and playback "
+                    "(heavier per frame; playback/scrub may be less smooth)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1077,6 +1136,7 @@ class MESH_PT_onion_skin(Panel):
         box = layout.box()
         box.label(text="Performance")
         box.prop(props, "skip_same_pose")
+        box.prop(props, "sync_bake")
         if props.mode != 'ACTIVE':
             box.prop(props, "ghost_detail", slider=True)
             box.prop(props, "bake_batch_size")

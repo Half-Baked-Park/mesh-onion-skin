@@ -28,6 +28,8 @@ from gpu_extras.batch import batch_for_shader
 
 # {오브젝트명: {프레임번호: (positions, indices)}}
 _onion_cache: dict[str, dict[int, tuple[np.ndarray, np.ndarray]]] = {}
+# {아마추어명: (액션명, 정렬된 키프레임 리스트)} — 매 프레임 키프레임 재순회 방지
+_keyframe_cache: dict[str, tuple[str, list[int]]] = {}
 _draw_handle = None
 _is_baking = False
 _rebuild_scheduled = False
@@ -200,6 +202,7 @@ def clear_cache(obj_name: str | None = None):
         _onion_cache.pop(obj_name, None)
     else:
         _onion_cache.clear()
+        _keyframe_cache.clear()
     _merged_before = None
     _merged_after = None
     _merged_dirty = True
@@ -234,6 +237,17 @@ def _get_active_action(arm):
     return None
 
 
+def _fcurve_key_frames(fc, kf_set: set[int]) -> None:
+    """fcurve 하나의 키프레임 프레임 번호를 kf_set에 일괄 적재 (C-속도 foreach_get)."""
+    n = len(fc.keyframe_points)
+    if n == 0:
+        return
+    co = np.empty(n * 2, dtype=np.float32)
+    fc.keyframe_points.foreach_get("co", co)
+    # co = [frame0, value0, frame1, value1, ...] → 프레임 성분만 추출, 정수 반올림
+    kf_set.update(np.rint(co[0::2]).astype(np.int64).tolist())
+
+
 def _collect_keyframes_from_action(action) -> set[int]:
     """액션에서 키프레임 프레임 번호 수집 (Blender 5.0 Layered Action + 레거시 호환)."""
     kf_set: set[int] = set()
@@ -243,16 +257,14 @@ def _collect_keyframes_from_action(action) -> set[int]:
             for strip in layer.strips:
                 for bag in strip.channelbags:
                     for fc in bag.fcurves:
-                        for kp in fc.keyframe_points:
-                            kf_set.add(round(kp.co[0]))
+                        _fcurve_key_frames(fc, kf_set)
     except (AttributeError, TypeError):
         pass
     # 레거시 폴백: action.fcurves 직접 접근
     if not kf_set:
         try:
             for fc in action.fcurves:
-                for kp in fc.keyframe_points:
-                    kf_set.add(round(kp.co[0]))
+                _fcurve_key_frames(fc, kf_set)
         except (AttributeError, RuntimeError):
             pass
     return kf_set
@@ -266,9 +278,16 @@ def _get_armature_keyframes(obj) -> tuple[str, list[int]]:
     action = _get_active_action(arm)
     if action is None:
         return f"{arm.name}: 활성 액션 없음", []
-    kf_set = _collect_keyframes_from_action(action)
-    if kf_set:
-        return f"{arm.name} > {action.name}: {len(kf_set)}개", sorted(kf_set)
+    # 아마추어별 캐시 — 액션이 바뀌거나 캐시가 클리어될 때만 재수집.
+    # (같은 액션에서 키프레임을 수정한 뒤엔 Update 버튼으로 갱신.)
+    cached = _keyframe_cache.get(arm.name)
+    if cached is not None and cached[0] == action.name:
+        frames = cached[1]
+    else:
+        frames = sorted(_collect_keyframes_from_action(action))
+        _keyframe_cache[arm.name] = (action.name, frames)
+    if frames:
+        return f"{arm.name} > {action.name}: {len(frames)}개", frames
     return f"{arm.name} > {action.name}: 키프레임 0개", []
 
 
@@ -355,6 +374,52 @@ def _build_prioritized_queue(current_frame: int, frames_to_objects: dict[int, li
     return items
 
 
+def _bake_queue_item(scene, props, frame, obj_names) -> None:
+    """(frame, obj_names) 큐 항목 하나를 캐시에 베이킹. 동기/점진 경로 공유.
+
+    _is_baking 설정과 현재 프레임 복원은 호출자 책임.
+    """
+    global _merged_dirty
+    scene.frame_set(frame)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    for obj_name in obj_names:
+        obj = bpy.data.objects.get(obj_name)
+        if obj is None:
+            continue
+        try:
+            geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat, props.ghost_detail)
+        except Exception:
+            continue
+        if geo is None:
+            continue
+        # 현재 프레임과 동일한 포즈면 스킵
+        if props.skip_same_pose:
+            cur_snap = _current_frame_snapshots.get(obj_name)
+            if cur_snap is not None and cur_snap.shape == geo[0].shape:
+                if np.allclose(cur_snap, geo[0], atol=1e-4):
+                    continue
+        _onion_cache.setdefault(obj.name, {})[frame] = geo
+        _merged_dirty = True
+
+
+def _bake_all_sync(scene, props) -> None:
+    """큐 전체를 즉시(블로킹) 베이킹. sync_bake(실시간 추종) 켜졌을 때 사용."""
+    global _is_baking
+    current = scene.frame_current
+    _is_baking = True
+    try:
+        while _bake_queue:
+            frame, obj_names = _bake_queue.popleft()
+            _bake_queue_item(scene, props, frame, obj_names)
+    finally:
+        # 뷰포트 깜빡임 방지를 위해 현재 프레임 복원
+        try:
+            scene.frame_set(current)
+        except Exception:
+            pass
+        _is_baking = False
+
+
 def rebuild_cache(scene, targets=None, force_clear: bool = False):
     """델타 계산 후 점진적 베이킹 큐에 등록. 논블로킹."""
     global _bake_generation, _bake_timer_running, _bake_progress, _bake_total_frames, _merged_dirty
@@ -429,6 +494,14 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
     _bake_total_frames = len(_bake_queue)
     _bake_progress = 0.0
 
+    # 동기(실시간 추종) 베이크 — 지금 전부 베이킹해 스크럽/재생 중에도 고스트가 따라옴
+    if props.sync_bake:
+        _bake_all_sync(scene, props)
+        _bake_timer_running = False
+        _bake_progress = 1.0
+        _merged_dirty = True
+        return
+
     # 점진적 베이킹 타이머 시작
     # 항상 새 타이머 등록 — 기존 타이머는 세대 불일치로 자동 중단
     _bake_timer_running = True
@@ -441,7 +514,7 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
 
 def _progressive_bake_tick(generation: int) -> float | None:
     """타이머 콜백 — 틱당 N 프레임 베이킹, Blender에 제어 반환."""
-    global _is_baking, _bake_timer_running, _bake_progress, _merged_dirty
+    global _is_baking, _bake_timer_running, _bake_progress
 
     # 세대 불일치 — 중단
     if generation != _bake_generation:
@@ -480,26 +553,7 @@ def _progressive_bake_tick(generation: int) -> float | None:
                 return None
 
             frame, obj_names = _bake_queue.popleft()
-            scene.frame_set(frame)
-            depsgraph = bpy.context.evaluated_depsgraph_get()
-            for obj_name in obj_names:
-                obj = bpy.data.objects.get(obj_name)
-                if obj is None:
-                    continue
-                try:
-                    geo = _bake_mesh_snapshot(obj, depsgraph, props.use_flat, props.ghost_detail)
-                except Exception:
-                    continue
-                if geo is None:
-                    continue
-                # 현재 프레임과 동일한 포즈면 스킵
-                if props.skip_same_pose:
-                    cur_snap = _current_frame_snapshots.get(obj_name)
-                    if cur_snap is not None and cur_snap.shape == geo[0].shape:
-                        if np.allclose(cur_snap, geo[0], atol=1e-4):
-                            continue
-                _onion_cache.setdefault(obj.name, {})[frame] = geo
-                _merged_dirty = True
+            _bake_queue_item(scene, props, frame, obj_names)
             frames_done += 1
     finally:
         # 뷰포트 깜빡임 방지를 위해 현재 프레임 복원
@@ -953,6 +1007,11 @@ class MeshOnionSkinProps(PropertyGroup):
         description="현재 포즈와 동일한 고스트 숨기기",
         update=_update_cache_full,
     )
+    sync_bake: BoolProperty(
+        name="동기 베이크 (실시간 추종)", default=False,
+        description="동기로 베이킹해 스크럽·재생 중에도 고스트가 따라옴 "
+                    "(프레임당 더 무거움; 재생·스크럽이 덜 부드러울 수 있음)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1077,6 +1136,7 @@ class MESH_PT_onion_skin(Panel):
         box = layout.box()
         box.label(text="성능")
         box.prop(props, "skip_same_pose")
+        box.prop(props, "sync_bake")
         if props.mode != 'ACTIVE':
             box.prop(props, "ghost_detail", slider=True)
             box.prop(props, "bake_batch_size")

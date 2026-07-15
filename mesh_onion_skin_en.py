@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Mesh Onion Skin",
     "author": "HB PARK",
-    "version": (2, 2, 0),
+    "version": (2, 3, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Onion Skin",
     "description": "GPU-based onion skin ghosts for 3D mesh animations",
@@ -20,6 +20,7 @@ from bpy.props import (
 )
 from bpy.types import PropertyGroup, Operator, Panel
 from gpu_extras.batch import batch_for_shader
+from mathutils import Matrix
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +35,6 @@ _draw_handle = None
 _is_baking = False
 _rebuild_scheduled = False
 _pending_rebuild = None  # (scene,)
-# Preserve original show_in_front value before mesh_in_front is applied {object_name: bool}
-_original_mesh_show_in_front: dict[str, bool] = {}
 
 # --- Progressive baking state ---
 _bake_queue: deque[tuple[int, list]] = deque()  # (frame, [obj_names]) 우선순위 큐
@@ -48,6 +47,11 @@ _bake_total_frames: int = 0  # 현재 베이킹 작업의 총 프레임 수
 _merged_before: gpu.types.GPUBatch | None = None
 _merged_after: gpu.types.GPUBatch | None = None
 _merged_dirty: bool = True
+
+# --- Mesh-in-front (MESH) occluder: stamps current pose at near-plane depth to hide ghosts ---
+# Unlike show_in_front, works in all shading modes (solid / material / rendered)
+_occluder_batch: gpu.types.GPUBatch | None = None
+_building_occluder: bool = False  # re-entrancy guard for the depsgraph handler
 
 # --- Same-pose detection (current frame snapshots) ---
 _current_frame_snapshots: dict[str, np.ndarray] = {}
@@ -197,7 +201,7 @@ def _collect_target_meshes(scene=None, context=None) -> list:
 
 def clear_cache(obj_name: str | None = None):
     """Remove geometry cache and invalidate merged batches."""
-    global _merged_before, _merged_after, _merged_dirty
+    global _merged_before, _merged_after, _merged_dirty, _occluder_batch
     if obj_name:
         _onion_cache.pop(obj_name, None)
     else:
@@ -206,6 +210,7 @@ def clear_cache(obj_name: str | None = None):
     _merged_before = None
     _merged_after = None
     _merged_dirty = True
+    _occluder_batch = None
 
 
 def _find_armature(obj):
@@ -445,6 +450,9 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
     stale = [k for k in _onion_cache if k not in valid_names]
     for k in stale:
         _onion_cache.pop(k, None)
+
+    # Rebuild current-pose occluder (MESH mode only, for near-plane depth)
+    _build_occluder(scene, props, targets)
 
     # Collect per-object target frames + build frame-first baking map (delta only)
     frames_to_objects: dict[int, list] = {}
@@ -691,6 +699,87 @@ def _build_merged_batches():
     _merged_after = _finalize_batch(after_parts)
 
 
+def _build_occluder(scene, props, targets, depsgraph=None):
+    """Build a world-space triangle occluder batch from current-frame meshes (MESH mode only).
+
+    Clears the occluder when not in MESH mode or when there are no targets.
+    Pass a depsgraph to reuse it (safe inside handlers); otherwise the current one is fetched.
+    """
+    global _occluder_batch
+    _occluder_batch = None
+    if props.in_front != 'MESH' or not props.enabled or not targets:
+        return
+    if depsgraph is None:
+        try:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+        except (AttributeError, RuntimeError):
+            return
+    parts_pos: list[np.ndarray] = []
+    parts_idx: list[np.ndarray] = []
+    offset = 0
+    for obj in targets:
+        try:
+            geo = _bake_mesh_snapshot(obj, depsgraph, False, 1.0)  # always triangles, full detail
+        except Exception:
+            continue
+        if geo is None:
+            continue
+        pos, idx = geo
+        parts_pos.append(pos)
+        parts_idx.append(idx + offset)
+        offset += len(pos)
+    if not parts_pos:
+        return
+    _occluder_batch = batch_for_shader(
+        gpu.shader.from_builtin('UNIFORM_COLOR'), 'TRIS',
+        {"pos": np.concatenate(parts_pos)},
+        indices=np.concatenate(parts_idx).tolist(),
+    )
+
+
+def _shading_enabled(props, shading_type: str) -> bool:
+    """Whether onion skin should draw in the current viewport shading type (per-shading filter)."""
+    if shading_type == 'WIREFRAME':
+        return props.show_in_wireframe
+    if shading_type == 'SOLID':
+        return props.show_in_solid
+    if shading_type == 'MATERIAL':
+        return props.show_in_material
+    if shading_type == 'RENDERED':
+        return props.show_in_rendered
+    return True
+
+
+def _draw_mesh_occluder():
+    """Stamp the current mesh at near-plane depth (no color) so ghosts are always hidden behind it.
+
+    Replaces projection row 2 with -row 3 to force NDC z to ~-1 (near plane) — no custom shader needed.
+    Unlike show_in_front, works in all shading modes (solid / material / rendered).
+    """
+    if _occluder_batch is None:
+        return
+    proj = gpu.matrix.get_projection_matrix()
+    rows = [list(proj[r]) for r in range(4)]
+    r3 = rows[3]
+    e = 0.9999  # just inside the near plane (exactly -1 may get clipped)
+    rows[2] = [-r3[0] * e, -r3[1] * e, -r3[2] * e, -r3[3] * e]
+    proj_near = Matrix(rows)
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    gpu.state.depth_test_set('ALWAYS')
+    gpu.state.depth_mask_set(True)
+    gpu.state.color_mask_set(False, False, False, False)
+    gpu.matrix.push_projection()
+    try:
+        gpu.matrix.load_projection_matrix(proj_near)
+        shader.bind()
+        shader.uniform_float("color", (0.0, 0.0, 0.0, 0.0))
+        _occluder_batch.draw(shader)
+    finally:
+        gpu.matrix.pop_projection()
+        gpu.state.color_mask_set(True, True, True, True)
+        gpu.state.depth_mask_set(False)
+
+
 def draw_onion_skins():
     """Viewport draw callback — renders 2 merged batches (before + after)."""
     global _merged_dirty
@@ -701,6 +790,15 @@ def draw_onion_skins():
         return
     if not props.enabled:
         return
+
+    # Per-shading-type visibility filter — check the shading type of the viewport being drawn
+    try:
+        shading_type = bpy.context.space_data.shading.type
+    except AttributeError:
+        shading_type = 'SOLID'
+    if not _shading_enabled(props, shading_type):
+        return
+
     if not _onion_cache:
         return
 
@@ -715,25 +813,31 @@ def draw_onion_skins():
 
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_mask_set(False)
-    if props.in_front == 'GHOST':
+    try:
+        if props.in_front == 'GHOST':
+            gpu.state.depth_test_set('NONE')
+        elif props.in_front == 'MESH':
+            # Stamp current mesh at near-plane depth first so ghosts fall behind it
+            _draw_mesh_occluder()
+            gpu.state.depth_test_set('LESS_EQUAL')
+        else:  # NONE
+            gpu.state.depth_test_set('LESS_EQUAL')
+        if props.use_flat:
+            gpu.state.line_width_set(1.5)
+
+        shader.bind()
+        if _merged_before is not None:
+            _merged_before.draw(shader)
+        if _merged_after is not None:
+            _merged_after.draw(shader)
+    finally:
+        # Always restore GPU state (prevents a black viewport if drawing throws)
+        gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
-    else:
-        gpu.state.depth_test_set('LESS_EQUAL')
-    if props.use_flat:
-        gpu.state.line_width_set(1.5)
-
-    shader.bind()
-
-    if _merged_before is not None:
-        _merged_before.draw(shader)
-    if _merged_after is not None:
-        _merged_after.draw(shader)
-
-    gpu.state.blend_set('NONE')
-    gpu.state.depth_test_set('NONE')
-    gpu.state.depth_mask_set(True)
-    if props.use_flat:
-        gpu.state.line_width_set(1.0)
+        gpu.state.depth_mask_set(True)
+        gpu.state.color_mask_set(True, True, True, True)
+        if props.use_flat:
+            gpu.state.line_width_set(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +858,50 @@ def _on_frame_change(scene, depsgraph):
     targets = _collect_target_meshes(scene=scene)
     rebuild_cache(scene, targets)
     _merged_dirty = True  # Alpha values depend on current frame
+    _request_viewport_redraw()
+
+
+@persistent
+def _on_depsgraph_update(scene, depsgraph):
+    """Refresh the MESH occluder to the current pose when bones/objects move without a frame change.
+
+    (Frame/setting changes go through rebuild_cache — this covers manual posing.)
+    """
+    global _building_occluder
+    if _is_baking or _building_occluder:
+        return
+    try:
+        props = scene.mesh_onion_skin
+    except AttributeError:
+        return
+    if not props.enabled or props.in_front != 'MESH':
+        return
+    # Bail early if nothing geometric/transform changed (ignore selection/property edits)
+    if not any(u.is_updated_geometry or u.is_updated_transform for u in depsgraph.updates):
+        return
+    targets = _collect_target_meshes(scene=scene)
+    if not targets:
+        return
+    # Rebuild only when a target mesh / its armature actually changed
+    names = {o.name for o in targets}
+    for o in targets:
+        arm = _find_armature(o)
+        if arm:
+            names.add(arm.name)
+    relevant = False
+    for upd in depsgraph.updates:
+        idb = upd.id
+        if isinstance(idb, bpy.types.Object) and idb.name in names \
+                and (upd.is_updated_geometry or upd.is_updated_transform):
+            relevant = True
+            break
+    if not relevant:
+        return
+    _building_occluder = True
+    try:
+        _build_occluder(scene, props, targets, depsgraph=depsgraph)
+    finally:
+        _building_occluder = False
     _request_viewport_redraw()
 
 
@@ -879,15 +1027,16 @@ def _update_display(self, context):
 
 
 def _update_in_front(self, context):
-    """On in-front mode change — apply/restore mesh show_in_front."""
-    targets = _collect_target_meshes(context=context)
-    for obj in targets:
-        if self.in_front == 'MESH':
-            if obj.name not in _original_mesh_show_in_front:
-                _original_mesh_show_in_front[obj.name] = obj.show_in_front
-            obj.show_in_front = True
-        else:
-            obj.show_in_front = _original_mesh_show_in_front.pop(obj.name, False)
+    """On in-front mode change — rebuild/clear the MESH occluder (no show_in_front used).
+
+    MESH is handled via a GPU occluder (near-plane depth), so it works in all shading modes.
+    """
+    _schedule_rebuild(context)
+    _request_viewport_redraw()
+
+
+def _update_redraw(self, context):
+    """For display filters etc. that only need a redraw (no batch rebuild)."""
     _request_viewport_redraw()
 
 
@@ -981,6 +1130,26 @@ class MeshOnionSkinProps(PropertyGroup):
         ],
         default='GHOST',
         update=_update_in_front,
+    )
+    show_in_wireframe: BoolProperty(
+        name="Wireframe View", default=True,
+        description="Show onion skin in wireframe-shaded viewports",
+        update=_update_redraw,
+    )
+    show_in_solid: BoolProperty(
+        name="Solid View", default=True,
+        description="Show onion skin in solid-shaded viewports",
+        update=_update_redraw,
+    )
+    show_in_material: BoolProperty(
+        name="Material Preview View", default=True,
+        description="Show onion skin in material-preview viewports",
+        update=_update_redraw,
+    )
+    show_in_rendered: BoolProperty(
+        name="Rendered View", default=True,
+        description="Show onion skin in rendered(-preview) viewports",
+        update=_update_redraw,
     )
     use_flat: BoolProperty(
         name="Wireframe", default=False,
@@ -1125,6 +1294,14 @@ class MESH_PT_onion_skin(Panel):
         box.prop(props, "in_front")
         box.prop(props, "use_flat")
 
+        # Per-shading visibility filter — show ghosts only in the checked shading modes
+        box.label(text="Show In")
+        row = box.row(align=True)
+        row.prop(props, "show_in_wireframe", text="", icon='SHADING_WIRE', toggle=True)
+        row.prop(props, "show_in_solid", text="", icon='SHADING_SOLID', toggle=True)
+        row.prop(props, "show_in_material", text="", icon='SHADING_TEXTURE', toggle=True)
+        row.prop(props, "show_in_rendered", text="", icon='SHADING_RENDERED', toggle=True)
+
         # Color settings
         box = layout.box()
         box.label(text="Colors")
@@ -1171,6 +1348,7 @@ def register():
     bpy.types.Scene.mesh_onion_skin = bpy.props.PointerProperty(
         type=MeshOnionSkinProps)
     bpy.app.handlers.frame_change_post.append(_on_frame_change)
+    bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
     bpy.app.handlers.load_post.append(_on_load_post)
     _draw_handle = bpy.types.SpaceView3D.draw_handler_add(
         draw_onion_skins, (), 'WINDOW', 'POST_VIEW')
@@ -1191,15 +1369,13 @@ def unregister():
     if _draw_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
         _draw_handle = None
-    # Restore show_in_front values changed by mesh_in_front
-    for obj_name, original in _original_mesh_show_in_front.items():
-        obj = bpy.data.objects.get(obj_name)
-        if obj:
-            obj.show_in_front = original
-    _original_mesh_show_in_front.clear()
     clear_cache()
     bpy.app.handlers.load_post.remove(_on_load_post)
     bpy.app.handlers.frame_change_post.remove(_on_frame_change)
+    try:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
+    except ValueError:
+        pass
     del bpy.types.Scene.mesh_onion_skin
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

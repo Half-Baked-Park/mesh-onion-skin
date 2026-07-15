@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Mesh Onion Skin",
     "author": "HB PARK",
-    "version": (2, 2, 0),
+    "version": (2, 3, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Onion Skin",
     "description": "GPU-based onion skin ghosts for 3D mesh animations",
@@ -20,6 +20,7 @@ from bpy.props import (
 )
 from bpy.types import PropertyGroup, Operator, Panel
 from gpu_extras.batch import batch_for_shader
+from mathutils import Matrix
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +35,6 @@ _draw_handle = None
 _is_baking = False
 _rebuild_scheduled = False
 _pending_rebuild = None  # (scene,)
-# mesh_in_front 적용 전 원래 show_in_front 값 보존 {오브젝트명: bool}
-_original_mesh_show_in_front: dict[str, bool] = {}
 
 # --- 점진적 베이킹 상태 ---
 _bake_queue: deque[tuple[int, list]] = deque()  # (frame, [obj_names]) 우선순위 큐
@@ -48,6 +47,11 @@ _bake_total_frames: int = 0  # 현재 베이킹 작업의 총 프레임 수
 _merged_before: gpu.types.GPUBatch | None = None
 _merged_after: gpu.types.GPUBatch | None = None
 _merged_dirty: bool = True
+
+# --- 메쉬 앞(MESH) 오클루더: 현재 포즈를 근평면 깊이로 찍어 고스트를 가림 ---
+# show_in_front과 달리 솔리드/머티리얼/렌더 모든 셰이딩 모드에서 동작
+_occluder_batch: gpu.types.GPUBatch | None = None
+_building_occluder: bool = False  # depsgraph 핸들러 재진입 방지
 
 # --- 동일 포즈 감지 (현재 프레임 스냅샷) ---
 _current_frame_snapshots: dict[str, np.ndarray] = {}
@@ -197,7 +201,7 @@ def _collect_target_meshes(scene=None, context=None) -> list:
 
 def clear_cache(obj_name: str | None = None):
     """지오메트리 캐시 제거 및 머지드 배치 무효화."""
-    global _merged_before, _merged_after, _merged_dirty
+    global _merged_before, _merged_after, _merged_dirty, _occluder_batch
     if obj_name:
         _onion_cache.pop(obj_name, None)
     else:
@@ -206,6 +210,7 @@ def clear_cache(obj_name: str | None = None):
     _merged_before = None
     _merged_after = None
     _merged_dirty = True
+    _occluder_batch = None
 
 
 def _find_armature(obj):
@@ -445,6 +450,9 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
     stale = [k for k in _onion_cache if k not in valid_names]
     for k in stale:
         _onion_cache.pop(k, None)
+
+    # 현재 포즈 오클루더 재빌드 (MESH 모드 전용, 근평면 깊이용)
+    _build_occluder(scene, props, targets)
 
     # 오브젝트별 타겟 프레임 수집 + 델타만 베이킹 맵 구성
     frames_to_objects: dict[int, list] = {}
@@ -691,6 +699,87 @@ def _build_merged_batches():
     _merged_after = _finalize_batch(after_parts)
 
 
+def _build_occluder(scene, props, targets, depsgraph=None):
+    """현재 프레임 메쉬들을 월드 트라이앵글 오클루더 배치로 빌드 (MESH 모드 전용).
+
+    MESH 모드가 아니거나 타겟이 없으면 오클루더를 비운다.
+    depsgraph를 넘기면 그것을 사용(핸들러 내 재진입 안전), 없으면 현재 depsgraph 조회.
+    """
+    global _occluder_batch
+    _occluder_batch = None
+    if props.in_front != 'MESH' or not props.enabled or not targets:
+        return
+    if depsgraph is None:
+        try:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+        except (AttributeError, RuntimeError):
+            return
+    parts_pos: list[np.ndarray] = []
+    parts_idx: list[np.ndarray] = []
+    offset = 0
+    for obj in targets:
+        try:
+            geo = _bake_mesh_snapshot(obj, depsgraph, False, 1.0)  # 항상 삼각형, 풀 디테일
+        except Exception:
+            continue
+        if geo is None:
+            continue
+        pos, idx = geo
+        parts_pos.append(pos)
+        parts_idx.append(idx + offset)
+        offset += len(pos)
+    if not parts_pos:
+        return
+    _occluder_batch = batch_for_shader(
+        gpu.shader.from_builtin('UNIFORM_COLOR'), 'TRIS',
+        {"pos": np.concatenate(parts_pos)},
+        indices=np.concatenate(parts_idx).tolist(),
+    )
+
+
+def _shading_enabled(props, shading_type: str) -> bool:
+    """현재 뷰포트 셰이딩 타입에서 어니언 스킨을 표시할지 (셰이더 종류별 필터)."""
+    if shading_type == 'WIREFRAME':
+        return props.show_in_wireframe
+    if shading_type == 'SOLID':
+        return props.show_in_solid
+    if shading_type == 'MATERIAL':
+        return props.show_in_material
+    if shading_type == 'RENDERED':
+        return props.show_in_rendered
+    return True
+
+
+def _draw_mesh_occluder():
+    """현재 메쉬를 근평면 깊이로 찍어(색 안 씀) 고스트가 항상 메쉬 뒤로 가려지게 함.
+
+    투영행렬 2행을 -3행으로 바꿔 NDC z를 ~-1(근평면)로 고정 → 커스텀 셰이더 불필요.
+    show_in_front과 달리 솔리드/머티리얼/렌더 모든 셰이딩 모드에서 동작.
+    """
+    if _occluder_batch is None:
+        return
+    proj = gpu.matrix.get_projection_matrix()
+    rows = [list(proj[r]) for r in range(4)]
+    r3 = rows[3]
+    e = 0.9999  # 근평면 바로 안쪽 (정확히 -1이면 클리핑될 수 있음)
+    rows[2] = [-r3[0] * e, -r3[1] * e, -r3[2] * e, -r3[3] * e]
+    proj_near = Matrix(rows)
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    gpu.state.depth_test_set('ALWAYS')
+    gpu.state.depth_mask_set(True)
+    gpu.state.color_mask_set(False, False, False, False)
+    gpu.matrix.push_projection()
+    try:
+        gpu.matrix.load_projection_matrix(proj_near)
+        shader.bind()
+        shader.uniform_float("color", (0.0, 0.0, 0.0, 0.0))
+        _occluder_batch.draw(shader)
+    finally:
+        gpu.matrix.pop_projection()
+        gpu.state.color_mask_set(True, True, True, True)
+        gpu.state.depth_mask_set(False)
+
+
 def draw_onion_skins():
     """뷰포트 드로우 콜백 — 머지드 배치 2개만 드로우 (before + after)."""
     global _merged_dirty
@@ -701,6 +790,15 @@ def draw_onion_skins():
         return
     if not props.enabled:
         return
+
+    # 셰이더 종류별 표시 필터 — 지금 그려지는 뷰포트의 셰이딩 타입 확인
+    try:
+        shading_type = bpy.context.space_data.shading.type
+    except AttributeError:
+        shading_type = 'SOLID'
+    if not _shading_enabled(props, shading_type):
+        return
+
     if not _onion_cache:
         return
 
@@ -715,25 +813,31 @@ def draw_onion_skins():
 
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_mask_set(False)
-    if props.in_front == 'GHOST':
+    try:
+        if props.in_front == 'GHOST':
+            gpu.state.depth_test_set('NONE')
+        elif props.in_front == 'MESH':
+            # 현재 메쉬를 근평면 깊이로 먼저 찍어 고스트를 그 뒤로 가림
+            _draw_mesh_occluder()
+            gpu.state.depth_test_set('LESS_EQUAL')
+        else:  # NONE
+            gpu.state.depth_test_set('LESS_EQUAL')
+        if props.use_flat:
+            gpu.state.line_width_set(1.5)
+
+        shader.bind()
+        if _merged_before is not None:
+            _merged_before.draw(shader)
+        if _merged_after is not None:
+            _merged_after.draw(shader)
+    finally:
+        # GPU 상태 항상 복원 (예외 시 뷰포트가 검게 깨지는 것 방지)
+        gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
-    else:
-        gpu.state.depth_test_set('LESS_EQUAL')
-    if props.use_flat:
-        gpu.state.line_width_set(1.5)
-
-    shader.bind()
-
-    if _merged_before is not None:
-        _merged_before.draw(shader)
-    if _merged_after is not None:
-        _merged_after.draw(shader)
-
-    gpu.state.blend_set('NONE')
-    gpu.state.depth_test_set('NONE')
-    gpu.state.depth_mask_set(True)
-    if props.use_flat:
-        gpu.state.line_width_set(1.0)
+        gpu.state.depth_mask_set(True)
+        gpu.state.color_mask_set(True, True, True, True)
+        if props.use_flat:
+            gpu.state.line_width_set(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +858,50 @@ def _on_frame_change(scene, depsgraph):
     targets = _collect_target_meshes(scene=scene)
     rebuild_cache(scene, targets)
     _merged_dirty = True  # 알파 값이 현재 프레임에 따라 변경됨
+    _request_viewport_redraw()
+
+
+@persistent
+def _on_depsgraph_update(scene, depsgraph):
+    """프레임 이동 없이 본/오브젝트만 움직여도 MESH 오클루더를 현재 포즈로 갱신.
+
+    (프레임·설정 변경은 rebuild_cache 경로가 처리 — 여기선 수동 포징 대응.)
+    """
+    global _building_occluder
+    if _is_baking or _building_occluder:
+        return
+    try:
+        props = scene.mesh_onion_skin
+    except AttributeError:
+        return
+    if not props.enabled or props.in_front != 'MESH':
+        return
+    # 지오/트랜스폼 변경이 하나도 없으면 조기 종료 (선택·프로퍼티 변경 등 무시)
+    if not any(u.is_updated_geometry or u.is_updated_transform for u in depsgraph.updates):
+        return
+    targets = _collect_target_meshes(scene=scene)
+    if not targets:
+        return
+    # 타겟 메쉬/아마추어가 실제로 바뀐 경우에만 재빌드
+    names = {o.name for o in targets}
+    for o in targets:
+        arm = _find_armature(o)
+        if arm:
+            names.add(arm.name)
+    relevant = False
+    for upd in depsgraph.updates:
+        idb = upd.id
+        if isinstance(idb, bpy.types.Object) and idb.name in names \
+                and (upd.is_updated_geometry or upd.is_updated_transform):
+            relevant = True
+            break
+    if not relevant:
+        return
+    _building_occluder = True
+    try:
+        _build_occluder(scene, props, targets, depsgraph=depsgraph)
+    finally:
+        _building_occluder = False
     _request_viewport_redraw()
 
 
@@ -879,15 +1027,16 @@ def _update_display(self, context):
 
 
 def _update_in_front(self, context):
-    """앞에 표시 모드 변경 시 – 메쉬 show_in_front 적용/복원."""
-    targets = _collect_target_meshes(context=context)
-    for obj in targets:
-        if self.in_front == 'MESH':
-            if obj.name not in _original_mesh_show_in_front:
-                _original_mesh_show_in_front[obj.name] = obj.show_in_front
-            obj.show_in_front = True
-        else:
-            obj.show_in_front = _original_mesh_show_in_front.pop(obj.name, False)
+    """앞에 표시 모드 변경 시 – MESH 오클루더 재빌드/해제 (show_in_front 미사용).
+
+    MESH는 GPU 오클루더(근평면 깊이)로 처리하므로 모든 셰이딩 모드에서 동작.
+    """
+    _schedule_rebuild(context)
+    _request_viewport_redraw()
+
+
+def _update_redraw(self, context):
+    """표시 필터 등 드로우만 갱신하면 되는 경우 (배치 재빌드 불필요)."""
     _request_viewport_redraw()
 
 
@@ -981,6 +1130,26 @@ class MeshOnionSkinProps(PropertyGroup):
         ],
         default='GHOST',
         update=_update_in_front,
+    )
+    show_in_wireframe: BoolProperty(
+        name="와이어프레임 뷰", default=True,
+        description="와이어프레임 셰이딩 뷰포트에서 어니언 스킨 표시",
+        update=_update_redraw,
+    )
+    show_in_solid: BoolProperty(
+        name="솔리드 뷰", default=True,
+        description="솔리드 셰이딩 뷰포트에서 어니언 스킨 표시",
+        update=_update_redraw,
+    )
+    show_in_material: BoolProperty(
+        name="머티리얼 미리보기 뷰", default=True,
+        description="머티리얼 미리보기 뷰포트에서 어니언 스킨 표시",
+        update=_update_redraw,
+    )
+    show_in_rendered: BoolProperty(
+        name="렌더 뷰", default=True,
+        description="렌더(미리보기) 뷰포트에서 어니언 스킨 표시",
+        update=_update_redraw,
     )
     use_flat: BoolProperty(
         name="와이어프레임", default=False,
@@ -1125,6 +1294,14 @@ class MESH_PT_onion_skin(Panel):
         box.prop(props, "in_front")
         box.prop(props, "use_flat")
 
+        # 표시할 뷰포트 셰이딩 필터 — 체크한 셰이딩 모드에서만 고스트 표시
+        box.label(text="표시 뷰")
+        row = box.row(align=True)
+        row.prop(props, "show_in_wireframe", text="", icon='SHADING_WIRE', toggle=True)
+        row.prop(props, "show_in_solid", text="", icon='SHADING_SOLID', toggle=True)
+        row.prop(props, "show_in_material", text="", icon='SHADING_TEXTURE', toggle=True)
+        row.prop(props, "show_in_rendered", text="", icon='SHADING_RENDERED', toggle=True)
+
         # 색상 설정
         box = layout.box()
         box.label(text="색상")
@@ -1171,6 +1348,7 @@ def register():
     bpy.types.Scene.mesh_onion_skin = bpy.props.PointerProperty(
         type=MeshOnionSkinProps)
     bpy.app.handlers.frame_change_post.append(_on_frame_change)
+    bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
     bpy.app.handlers.load_post.append(_on_load_post)
     _draw_handle = bpy.types.SpaceView3D.draw_handler_add(
         draw_onion_skins, (), 'WINDOW', 'POST_VIEW')
@@ -1191,15 +1369,13 @@ def unregister():
     if _draw_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
         _draw_handle = None
-    # mesh_in_front로 변경된 show_in_front 복원
-    for obj_name, original in _original_mesh_show_in_front.items():
-        obj = bpy.data.objects.get(obj_name)
-        if obj:
-            obj.show_in_front = original
-    _original_mesh_show_in_front.clear()
     clear_cache()
     bpy.app.handlers.load_post.remove(_on_load_post)
     bpy.app.handlers.frame_change_post.remove(_on_frame_change)
+    try:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
+    except ValueError:
+        pass
     del bpy.types.Scene.mesh_onion_skin
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Mesh Onion Skin",
     "author": "HB PARK",
-    "version": (2, 3, 0),
+    "version": (2, 3, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Onion Skin",
     "description": "GPU-based onion skin ghosts for 3D mesh animations",
@@ -52,6 +52,12 @@ _merged_dirty: bool = True
 # show_in_front과 달리 솔리드/머티리얼/렌더 모든 셰이딩 모드에서 동작
 _occluder_batch: gpu.types.GPUBatch | None = None
 _building_occluder: bool = False  # depsgraph 핸들러 재진입 방지
+
+# --- 편집 감지 후 고스트 재빌드 디바운스 (키프레임 이동/포즈 편집) ---
+_EDIT_SETTLE: float = 0.2  # 편집이 멎고 이 시간(초)이 지나면 재빌드 (드래그 중 frame_set 방지)
+_edit_seq: int = 0         # 편집 감지마다 증가
+_edit_ack: int = 0         # settle 타이머가 마지막으로 확인한 값
+_edit_rebuild_armed: bool = False
 
 # --- 동일 포즈 감지 (현재 프레임 스냅샷) ---
 _current_frame_snapshots: dict[str, np.ndarray] = {}
@@ -863,46 +869,92 @@ def _on_frame_change(scene, depsgraph):
 
 @persistent
 def _on_depsgraph_update(scene, depsgraph):
-    """프레임 이동 없이 본/오브젝트만 움직여도 MESH 오클루더를 현재 포즈로 갱신.
+    """프레임 이동 없이 타겟을 편집(수동 포징/키프레임 리타이밍)했을 때 고스트·오클루더를 갱신.
 
-    (프레임·설정 변경은 rebuild_cache 경로가 처리 — 여기선 수동 포징 대응.)
+    - 오클루더(MESH): 현재 포즈로 즉시 재빌드 (프레임 샘플링 없어 드래그 중에도 안전).
+    - 고스트 캐시: 실제 애니 편집(타겟 Action 업데이트)이면 캐시 무효화 후 재빌드하되,
+      재빌드는 frame_set을 쓰므로 편집이 멎을 때까지 디바운스 (_edit_settle_tick).
+    (순수 프레임 변경은 _on_frame_change가 처리하고 Action을 안 건드리므로 여기서 무시됨.)
     """
-    global _building_occluder
+    global _building_occluder, _edit_seq, _edit_ack, _edit_rebuild_armed
     if _is_baking or _building_occluder:
         return
     try:
         props = scene.mesh_onion_skin
     except AttributeError:
         return
-    if not props.enabled or props.in_front != 'MESH':
+    if not props.enabled:
         return
-    # 지오/트랜스폼 변경이 하나도 없으면 조기 종료 (선택·프로퍼티 변경 등 무시)
-    if not any(u.is_updated_geometry or u.is_updated_transform for u in depsgraph.updates):
+    # 지오/트랜스폼 변경도 Action 편집도 없으면 조기 종료 (선택·프로퍼티 변경 등 무시)
+    if not any(u.is_updated_geometry or u.is_updated_transform or isinstance(u.id, bpy.types.Action)
+               for u in depsgraph.updates):
         return
     targets = _collect_target_meshes(scene=scene)
     if not targets:
         return
-    # 타겟 메쉬/아마추어가 실제로 바뀐 경우에만 재빌드
+    # 타겟 메쉬/아마추어 이름 + 관련 액션 이름 수집
     names = {o.name for o in targets}
+    action_names: set[str] = set()
     for o in targets:
+        ad = o.animation_data
+        if ad and ad.action:
+            action_names.add(ad.action.name)  # 오브젝트 자체 액션 (예: Keymesh)
         arm = _find_armature(o)
         if arm:
             names.add(arm.name)
-    relevant = False
+            act = _get_active_action(arm)
+            if act:
+                action_names.add(act.name)
+    # 현재 포즈가 움직였나(오클루더용) vs 애니 데이터가 편집됐나(고스트 재빌드용) 구분
+    geo_changed = False
+    anim_edited = False
     for upd in depsgraph.updates:
         idb = upd.id
         if isinstance(idb, bpy.types.Object) and idb.name in names \
                 and (upd.is_updated_geometry or upd.is_updated_transform):
-            relevant = True
-            break
-    if not relevant:
+            geo_changed = True
+        elif isinstance(idb, bpy.types.Action) and idb.name in action_names:
+            anim_edited = True
+    if not geo_changed and not anim_edited:
         return
-    _building_occluder = True
-    try:
-        _build_occluder(scene, props, targets, depsgraph=depsgraph)
-    finally:
-        _building_occluder = False
+    # MESH 오클루더는 현재 포즈를 따라감 (frame_set 없음 → 드래그 중에도 안전)
+    if geo_changed and props.in_front == 'MESH':
+        _building_occluder = True
+        try:
+            _build_occluder(scene, props, targets, depsgraph=depsgraph)
+        finally:
+            _building_occluder = False
+    # 애니 편집 감지 → 고스트 지오메트리 stale. 편집이 멎을 때까지 디바운스 후 재빌드
+    if anim_edited:
+        _edit_seq += 1
+        if not _edit_rebuild_armed:
+            _edit_rebuild_armed = True
+            _edit_ack = _edit_seq
+            bpy.app.timers.register(_edit_settle_tick, first_interval=_EDIT_SETTLE)
     _request_viewport_redraw()
+
+
+def _edit_settle_tick() -> float | None:
+    """애니 편집이 멎은 뒤(디바운스) 고스트 지오메트리를 재빌드."""
+    global _edit_rebuild_armed, _edit_ack
+    # 지난 tick 이후 편집이 더 들어왔으면 계속 대기 (드래그 중 frame_set 금지)
+    if _edit_seq != _edit_ack:
+        _edit_ack = _edit_seq
+        return _EDIT_SETTLE
+    if _is_baking:
+        return _EDIT_SETTLE  # 베이크 진행 중 — 잠시 후 재시도
+    _edit_rebuild_armed = False
+    try:
+        scene = bpy.context.scene
+        props = scene.mesh_onion_skin
+    except (AttributeError, RuntimeError):
+        return None
+    if not props.enabled:
+        return None
+    targets = _collect_target_meshes(scene=scene)
+    rebuild_cache(scene, targets, force_clear=True)
+    _request_viewport_redraw()
+    return None
 
 
 @persistent
@@ -1355,11 +1407,17 @@ def register():
 
 
 def unregister():
-    global _draw_handle, _rebuild_scheduled, _bake_timer_running, _bake_generation
+    global _draw_handle, _rebuild_scheduled, _bake_timer_running, _bake_generation, _edit_rebuild_armed
     # 점진적 베이킹 타이머 정리 — 세대 증가로 pending 타이머 즉시 중단
     _bake_generation += 1
     _bake_queue.clear()
     _bake_timer_running = False
+    # 편집 디바운스 타이머 정리
+    _edit_rebuild_armed = False
+    try:
+        bpy.app.timers.unregister(_edit_settle_tick)
+    except (ValueError, RuntimeError):
+        pass
     if _rebuild_scheduled:
         try:
             bpy.app.timers.unregister(_do_rebuild)

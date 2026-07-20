@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Mesh Onion Skin",
     "author": "HB PARK",
-    "version": (2, 3, 0),
+    "version": (2, 3, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Onion Skin",
     "description": "GPU-based onion skin ghosts for 3D mesh animations",
@@ -52,6 +52,12 @@ _merged_dirty: bool = True
 # Unlike show_in_front, works in all shading modes (solid / material / rendered)
 _occluder_batch: gpu.types.GPUBatch | None = None
 _building_occluder: bool = False  # re-entrancy guard for the depsgraph handler
+
+# --- Debounced ghost rebuild after an edit (keyframe re-timing / pose editing) ---
+_EDIT_SETTLE: float = 0.2  # rebuild once edits have been quiet this long (avoids frame_set mid-drag)
+_edit_seq: int = 0         # bumped on every detected edit
+_edit_ack: int = 0         # last value the settle timer observed
+_edit_rebuild_armed: bool = False
 
 # --- Same-pose detection (current frame snapshots) ---
 _current_frame_snapshots: dict[str, np.ndarray] = {}
@@ -863,46 +869,92 @@ def _on_frame_change(scene, depsgraph):
 
 @persistent
 def _on_depsgraph_update(scene, depsgraph):
-    """Refresh the MESH occluder to the current pose when bones/objects move without a frame change.
+    """Refresh ghosts/occluder when a target is edited without a frame change (manual posing, keyframe re-timing).
 
-    (Frame/setting changes go through rebuild_cache — this covers manual posing.)
+    - Occluder (MESH): rebuilt immediately from the current pose (cheap, no frame sampling — safe mid-drag).
+    - Ghost cache: an actual animation-data edit (a target Action updated) invalidates the cache; the heavy
+      rebuild is debounced until edits settle (_edit_settle_tick) so it never runs a frame_set mid-drag.
+    (Pure frame changes go through _on_frame_change and never touch the Action datablock, so they are ignored here.)
     """
-    global _building_occluder
+    global _building_occluder, _edit_seq, _edit_ack, _edit_rebuild_armed
     if _is_baking or _building_occluder:
         return
     try:
         props = scene.mesh_onion_skin
     except AttributeError:
         return
-    if not props.enabled or props.in_front != 'MESH':
+    if not props.enabled:
         return
-    # Bail early if nothing geometric/transform changed (ignore selection/property edits)
-    if not any(u.is_updated_geometry or u.is_updated_transform for u in depsgraph.updates):
+    # Bail early if nothing geometric/transform changed and no Action was edited (ignore selection/property edits)
+    if not any(u.is_updated_geometry or u.is_updated_transform or isinstance(u.id, bpy.types.Action)
+               for u in depsgraph.updates):
         return
     targets = _collect_target_meshes(scene=scene)
     if not targets:
         return
-    # Rebuild only when a target mesh / its armature actually changed
+    # Names of target meshes + their armatures, and the actions driving them
     names = {o.name for o in targets}
+    action_names: set[str] = set()
     for o in targets:
+        ad = o.animation_data
+        if ad and ad.action:
+            action_names.add(ad.action.name)  # object's own action (e.g. Keymesh)
         arm = _find_armature(o)
         if arm:
             names.add(arm.name)
-    relevant = False
+            act = _get_active_action(arm)
+            if act:
+                action_names.add(act.name)
+    # Separate "current pose moved" (drives the occluder) from "animation data edited" (drives the ghost rebuild)
+    geo_changed = False
+    anim_edited = False
     for upd in depsgraph.updates:
         idb = upd.id
         if isinstance(idb, bpy.types.Object) and idb.name in names \
                 and (upd.is_updated_geometry or upd.is_updated_transform):
-            relevant = True
-            break
-    if not relevant:
+            geo_changed = True
+        elif isinstance(idb, bpy.types.Action) and idb.name in action_names:
+            anim_edited = True
+    if not geo_changed and not anim_edited:
         return
-    _building_occluder = True
-    try:
-        _build_occluder(scene, props, targets, depsgraph=depsgraph)
-    finally:
-        _building_occluder = False
+    # MESH occluder follows the live pose (no frame sampling — safe during an active drag)
+    if geo_changed and props.in_front == 'MESH':
+        _building_occluder = True
+        try:
+            _build_occluder(scene, props, targets, depsgraph=depsgraph)
+        finally:
+            _building_occluder = False
+    # Animation data edited → ghost geometry is stale. Debounce the heavy rebuild until edits settle.
+    if anim_edited:
+        _edit_seq += 1
+        if not _edit_rebuild_armed:
+            _edit_rebuild_armed = True
+            _edit_ack = _edit_seq
+            bpy.app.timers.register(_edit_settle_tick, first_interval=_EDIT_SETTLE)
     _request_viewport_redraw()
+
+
+def _edit_settle_tick() -> float | None:
+    """Rebuild ghost geometry once animation edits have settled (debounce)."""
+    global _edit_rebuild_armed, _edit_ack
+    # More edits since the last tick → keep waiting (never frame_set during an active drag)
+    if _edit_seq != _edit_ack:
+        _edit_ack = _edit_seq
+        return _EDIT_SETTLE
+    if _is_baking:
+        return _EDIT_SETTLE  # a bake is running — retry shortly
+    _edit_rebuild_armed = False
+    try:
+        scene = bpy.context.scene
+        props = scene.mesh_onion_skin
+    except (AttributeError, RuntimeError):
+        return None
+    if not props.enabled:
+        return None
+    targets = _collect_target_meshes(scene=scene)
+    rebuild_cache(scene, targets, force_clear=True)
+    _request_viewport_redraw()
+    return None
 
 
 @persistent
@@ -1355,11 +1407,17 @@ def register():
 
 
 def unregister():
-    global _draw_handle, _rebuild_scheduled, _bake_timer_running, _bake_generation
+    global _draw_handle, _rebuild_scheduled, _bake_timer_running, _bake_generation, _edit_rebuild_armed
     # Cancel progressive bake timer — increment generation so any pending timer self-aborts
     _bake_generation += 1
     _bake_queue.clear()
     _bake_timer_running = False
+    # Cancel the edit-settle debounce timer
+    _edit_rebuild_armed = False
+    try:
+        bpy.app.timers.unregister(_edit_settle_tick)
+    except (ValueError, RuntimeError):
+        pass
     if _rebuild_scheduled:
         try:
             bpy.app.timers.unregister(_do_rebuild)

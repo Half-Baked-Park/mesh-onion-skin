@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Mesh Onion Skin",
     "author": "HB PARK",
-    "version": (2, 3, 1),
+    "version": (2, 3, 2),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Onion Skin",
     "description": "GPU-based onion skin ghosts for 3D mesh animations",
@@ -58,6 +58,21 @@ _EDIT_SETTLE: float = 0.2  # rebuild once edits have been quiet this long (avoid
 _edit_seq: int = 0         # bumped on every detected edit
 _edit_ack: int = 0         # last value the settle timer observed
 _edit_rebuild_armed: bool = False
+
+# --- Real-edit detection for the debounced rebuild ---
+# The depsgraph flags the target Action as "updated" even when its keyframes did not actually change:
+# undo/redo restores the datablock, pose-mode undo, and other spurious re-evals all raise the flag.
+# Arming a frame_set rebuild for those false positives re-evaluates the fcurves and overwrites unkeyed
+# pose work back to the keyframed values (the undo-collapses-the-pose bug). So the rebuild is armed only
+# when the Action's keyframe *content* actually changed, tracked here by a per-Action signature.
+_last_action_sig: dict[str, tuple] = {}
+
+# Targets whose live pose the current bake must protect from its own frame_set() sampling (or None to skip).
+# Each bake block captures these objects' pose FRESH at its start and restores it at its end, within one
+# synchronous block — so it never writes a stale pose over the user's live posing. None on frame-change
+# rebuilds: a frame change already re-evaluated the pose (nothing unkeyed to protect), and skipping avoids
+# a redundant per-frame armature re-eval from the restore's matrix_basis writes.
+_bake_capture_targets: list | None = None
 
 # --- Same-pose detection (current frame snapshots) ---
 _current_frame_snapshots: dict[str, np.ndarray] = {}
@@ -413,27 +428,80 @@ def _bake_queue_item(scene, props, frame, obj_names) -> None:
         _merged_dirty = True
 
 
+def _capture_pose_state(targets):
+    """Snapshot the live local transforms that a bake's scene.frame_set() would re-evaluate away.
+
+    A bake samples ghost frames with scene.frame_set(), which re-evaluates every fcurve — silently
+    overwriting an unkeyed pose (posed but not keyframed) with the keyframed values. Capturing the target
+    armatures' pose-bone / object matrix_basis before the bake and restoring it after keeps such work.
+    Returns a restore token (list) or None.
+    """
+    state = []
+    seen: set[str] = set()
+
+    def _grab(obj):
+        if obj is None or obj.name in seen:
+            return
+        seen.add(obj.name)
+        try:
+            bones = ([(pb.name, pb.matrix_basis.copy()) for pb in obj.pose.bones]
+                     if obj.type == 'ARMATURE' and obj.pose else None)
+            state.append((obj, bones, obj.matrix_basis.copy()))
+        except (AttributeError, ReferenceError):
+            pass
+
+    for o in targets:
+        _grab(o)
+        _grab(_find_armature(o))
+    return state or None
+
+
+def _restore_pose_state(state):
+    """Re-apply transforms captured by _capture_pose_state. Call inside the _is_baking window."""
+    if not state:
+        return
+    for obj, bones, obj_basis in state:
+        try:
+            obj.matrix_basis = obj_basis
+            if bones:
+                pbs = obj.pose.bones
+                for name, mb in bones:
+                    pb = pbs.get(name)
+                    if pb is not None:
+                        pb.matrix_basis = mb
+        except (ReferenceError, RuntimeError, AttributeError):
+            pass
+
+
 def _bake_all_sync(scene, props) -> None:
     """Bake the whole queue immediately (blocking). Used when sync_bake (live follow) is on."""
     global _is_baking
     current = scene.frame_current
     _is_baking = True
+    pose = _capture_pose_state(_bake_capture_targets) if _bake_capture_targets else None
     try:
         while _bake_queue:
             frame, obj_names = _bake_queue.popleft()
             _bake_queue_item(scene, props, frame, obj_names)
     finally:
-        # Restore current frame to prevent viewport flicker
+        # Restore current frame + the pose captured at the top of this synchronous block
         try:
             scene.frame_set(current)
         except Exception:
             pass
+        _restore_pose_state(pose)
         _is_baking = False
 
 
-def rebuild_cache(scene, targets=None, force_clear: bool = False):
-    """Compute delta and enqueue progressive baking. Non-blocking."""
+def rebuild_cache(scene, targets=None, force_clear: bool = False, capture_pose: bool = True):
+    """Compute delta and enqueue progressive baking. Non-blocking.
+
+    capture_pose: snapshot/restore the live pose around the bake's frame_set so an unkeyed pose is not
+    clobbered. Pass False for frame-change rebuilds — no unkeyed pose can exist there, and the restore's
+    per-bone matrix_basis writes would force a redundant armature re-eval every frame (playback slowdown).
+    """
     global _bake_generation, _bake_timer_running, _bake_progress, _bake_total_frames, _merged_dirty
+    global _bake_capture_targets
     if _is_baking:
         return
 
@@ -460,6 +528,18 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
     # Rebuild current-pose occluder (MESH mode only, for near-plane depth)
     _build_occluder(scene, props, targets)
 
+    # Prime edit-detection baselines once (cold start), so the first real edit after (re)build is caught.
+    # Undo leaves these identical, so it stays a no-op; _on_depsgraph_update maintains them thereafter.
+    for obj in targets:
+        ad = obj.animation_data
+        if ad and ad.action and ad.action.name not in _last_action_sig:
+            _last_action_sig[ad.action.name] = _action_signature(ad.action)
+        arm = _find_armature(obj)
+        if arm:
+            act = _get_active_action(arm)
+            if act and act.name not in _last_action_sig:
+                _last_action_sig[act.name] = _action_signature(act)
+
     # Collect per-object target frames + build frame-first baking map (delta only)
     frames_to_objects: dict[int, list] = {}
     for obj in targets:
@@ -485,6 +565,9 @@ def rebuild_cache(scene, targets=None, force_clear: bool = False):
 
     # Cancel any in-progress bake
     _bake_generation += 1
+
+    # Remember whose pose the bake must protect from its frame_set() (captured FRESH per bake block below)
+    _bake_capture_targets = targets if capture_pose else None
 
     # Capture current-frame snapshots for same-pose detection (once per rebuild)
     _current_frame_snapshots.clear()
@@ -557,6 +640,7 @@ def _progressive_bake_tick(generation: int) -> float | None:
     batch_size = max(1, props.bake_batch_size)
     current = scene.frame_current
     _is_baking = True
+    pose = _capture_pose_state(_bake_capture_targets) if _bake_capture_targets else None
 
     try:
         frames_done = 0
@@ -570,11 +654,12 @@ def _progressive_bake_tick(generation: int) -> float | None:
             _bake_queue_item(scene, props, frame, obj_names)
             frames_done += 1
     finally:
-        # Restore current frame to prevent viewport flicker
+        # Restore current frame + the pose captured at the top of this tick (fresh — never stale)
         try:
             scene.frame_set(current)
         except Exception:
             pass
+        _restore_pose_state(pose)
         _is_baking = False
 
     # Update progress
@@ -862,9 +947,52 @@ def _on_frame_change(scene, depsgraph):
     if not props.enabled:
         return
     targets = _collect_target_meshes(scene=scene)
-    rebuild_cache(scene, targets)
+    rebuild_cache(scene, targets, capture_pose=False)  # frame change → no unkeyed pose to protect
     _merged_dirty = True  # Alpha values depend on current frame
     _request_viewport_redraw()
+
+
+def _action_signature(action) -> tuple:
+    """Fingerprint of an Action's keyframe content (keyframe count + order-independent content hash).
+
+    Changes when keyframes are added / removed / moved (retiming) or their values edited; stays identical
+    when the depsgraph merely re-flags the Action as "updated" without a real edit (undo/redo, pose-mode
+    undo). Used to distinguish a genuine animation edit from a spurious update, so the destructive
+    frame_set rebuild only runs for the former. The per-channel hash folds in the channel identity, so
+    even sum-preserving edits (e.g. +1/-1 key moves, value swaps between channels) still register.
+    """
+    count = 0
+    h = 0
+
+    def _accum(fcurves) -> int:
+        nonlocal count, h
+        n = 0
+        for fc in fcurves:
+            n += 1
+            kfs = fc.keyframe_points
+            m = len(kfs)
+            if not m:
+                continue
+            arr = np.empty(m * 2, dtype=np.float64)
+            kfs.foreach_get('co', arr)
+            count += m
+            h ^= hash((fc.data_path, fc.array_index, arr.tobytes()))
+        return n
+
+    layered = 0
+    try:
+        for layer in action.layers:            # Blender 5.0+ layered action
+            for strip in layer.strips:
+                for bag in strip.channelbags:
+                    layered += _accum(bag.fcurves)
+    except AttributeError:
+        pass
+    if layered == 0:                           # legacy fallback only when no layered fcurves exist
+        try:
+            _accum(action.fcurves)
+        except (AttributeError, RuntimeError):
+            pass
+    return (count, h)
 
 
 @persistent
@@ -914,7 +1042,12 @@ def _on_depsgraph_update(scene, depsgraph):
                 and (upd.is_updated_geometry or upd.is_updated_transform):
             geo_changed = True
         elif isinstance(idb, bpy.types.Action) and idb.name in action_names:
-            anim_edited = True
+            # "updated" alone is a false positive on undo/redo — only a real keyframe change counts.
+            sig = _action_signature(idb)
+            prev = _last_action_sig.get(idb.name)
+            _last_action_sig[idb.name] = sig
+            if prev is not None and prev != sig:
+                anim_edited = True
     if not geo_changed and not anim_edited:
         return
     # MESH occluder follows the live pose (no frame sampling — safe during an active drag)
@@ -924,7 +1057,7 @@ def _on_depsgraph_update(scene, depsgraph):
             _build_occluder(scene, props, targets, depsgraph=depsgraph)
         finally:
             _building_occluder = False
-    # Animation data edited → ghost geometry is stale. Debounce the heavy rebuild until edits settle.
+    # Real keyframe edit → ghost geometry is stale. Debounce the heavy rebuild until edits settle.
     if anim_edited:
         _edit_seq += 1
         if not _edit_rebuild_armed:
@@ -959,6 +1092,7 @@ def _edit_settle_tick() -> float | None:
 
 @persistent
 def _on_load_post(*_args):
+    _last_action_sig.clear()  # drop stale edit-detection baselines from the previous file
     clear_cache()
 
 
@@ -1428,12 +1562,13 @@ def unregister():
         bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
         _draw_handle = None
     clear_cache()
-    bpy.app.handlers.load_post.remove(_on_load_post)
-    bpy.app.handlers.frame_change_post.remove(_on_frame_change)
-    try:
-        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
-    except ValueError:
-        pass
+    for _hlist, _h in ((bpy.app.handlers.load_post, _on_load_post),
+                       (bpy.app.handlers.frame_change_post, _on_frame_change),
+                       (bpy.app.handlers.depsgraph_update_post, _on_depsgraph_update)):
+        try:
+            _hlist.remove(_h)
+        except ValueError:
+            pass
     del bpy.types.Scene.mesh_onion_skin
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
